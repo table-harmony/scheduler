@@ -20,6 +20,20 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## Convex database
+
+The scheduler stores members, chore types and scheduled chores, duty types and
+scheduled duties, and workload defaults in Convex. The schema is defined in
+`convex/schema.ts`; queries and mutations are in `convex/scheduler.ts`.
+
+Run `npx convex dev` to keep the configured Convex deployment synchronized
+while developing, and run `npm run dev` to start the Next.js app. The app needs
+`NEXT_PUBLIC_CONVEX_URL` set to the Convex deployment URL.
+
+The routes have separate page components under `components/scheduler/`. Shared
+Convex state and scheduler actions live in `app/scheduler-context.tsx`, mounted
+once by the root provider so navigating between pages keeps the same live data.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:
