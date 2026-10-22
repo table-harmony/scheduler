@@ -6,7 +6,6 @@ import {
   createContext,
   useContext,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -14,6 +13,7 @@ import {
   defaultWorkloadWeights,
   weekDays,
   type SchedulingRules,
+  type MemberConstraints,
   type TaskRestriction,
   type Weekday,
   type WeeklyTasks,
@@ -23,6 +23,8 @@ import {
   assignWeeklyChores,
   calculateWeeklyWorkloads,
 } from "@/lib/assignChores";
+import { canAssignChore } from "@/lib/choreEligibility";
+import type { WeeklyChoreAssignments } from "@/lib/types";
 
 export type TaskEntry = {
   member: string;
@@ -35,20 +37,53 @@ export type SchedulerData = {
   chores: Record<Weekday, string[]>;
   weights: WorkloadWeights;
   rules: SchedulingRules;
+  memberConstraints: MemberConstraints;
+};
+
+export type SavedSchedule = {
+  id: string;
+  savedAt: number;
+  assignments: { day: Weekday; chore: string; member: string | null }[];
+};
+
+export type GeneratedSchedule = {
+  assignments: ReturnType<typeof assignWeeklyChores>;
+  workloads: Record<string, number>;
+  people: string[];
+  weights: WorkloadWeights;
 };
 
 export type PageKind = "schedule" | "members" | "duties" | "rules";
 
 export type SchedulerContextValue = {
   data: SchedulerData;
-  assignments: ReturnType<typeof assignWeeklyChores>;
-  workloads: Record<string, number>;
+  savedAssignments: Record<Weekday, (string | null)[]>;
+  persistedAssignments: Record<Weekday, (string | null)[]>;
+  savedSchedules: SavedSchedule[];
+  generateSchedule: () => GeneratedSchedule;
+  createManualSchedule: () => GeneratedSchedule;
+  saveScheduleHistory: (
+    assignments: WeeklyChoreAssignments,
+  ) => Promise<boolean>;
+  setChoreAssignment: (
+    day: Weekday,
+    index: number,
+    member: string | null,
+  ) => Promise<boolean>;
   loaded: boolean;
   saving: boolean;
   error: string | null;
   setMemberName: (index: number, name: string) => void;
   addMember: () => void;
   removeMember: (index: number) => void;
+  setMemberConstraint: (
+    member: string,
+    category: "blockedDuties" | "blockedChores",
+    name: string,
+    blocked: boolean,
+  ) => void;
+  setMemberDayOff: (member: string, day: Weekday, isOff: boolean) => void;
+  setChoreRestriction: (name: string, onePerMemberPerDay: boolean) => void;
   addChore: (day: Weekday) => void;
   setChore: (day: Weekday, index: number, name: string) => void;
   removeChore: (day: Weekday, index: number) => void;
@@ -101,7 +136,8 @@ function createEmptySchedule(): SchedulerData {
     tasks: mapWeek(() => []),
     chores: mapWeek(() => []),
     weights: defaultWorkloadWeights,
-    rules: { tasks: {} },
+    rules: { tasks: {}, chores: {} },
+    memberConstraints: {},
   };
 }
 
@@ -124,15 +160,59 @@ function toWeeklyTasks(entries: Record<Weekday, TaskEntry[]>): WeeklyTasks {
   return tasks;
 }
 
+function hasAssignmentConflict(
+  data: SchedulerData,
+  savedAssignments: Record<Weekday, (string | null)[]>,
+  tasks: Record<Weekday, TaskEntry[]> = data.tasks,
+  chores: Record<Weekday, string[]> = data.chores,
+  rules: SchedulingRules = data.rules,
+  memberConstraints: MemberConstraints = data.memberConstraints,
+): boolean {
+  const weeklyTasks = toWeeklyTasks(tasks);
+  return weekDays.some((day) =>
+    (chores[day] ?? []).some((chore, index) => {
+      const member = savedAssignments[day][index];
+      return (
+        member !== null &&
+        member !== undefined &&
+        !canAssignChore(
+          member,
+          day,
+          chore,
+          weeklyTasks,
+          rules,
+          memberConstraints,
+          (chores[day] ?? []).map((assignedChore, assignmentIndex) => ({
+            chore: assignedChore,
+            member:
+              assignmentIndex === index
+                ? null
+                : savedAssignments[day][assignmentIndex] ?? null,
+          })),
+        )
+      );
+    }),
+  );
+}
+
 export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   const [data, setData] = useState(createEmptySchedule);
+  const [savedAssignments, setSavedAssignments] = useState<
+    Record<Weekday, (string | null)[]>
+  >(mapWeek(() => []));
+  const [persistedAssignments, setPersistedAssignments] = useState<
+    Record<Weekday, (string | null)[]>
+  >(mapWeek(() => []));
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const hasHydrated = useRef(false);
+  const hasDraftChanges = useRef(false);
   const skipNextSave = useRef(false);
   const snapshot = useQuery(api.scheduler.getSnapshot, {});
+  const savedSchedules = useQuery(api.scheduler.getSavedSchedules, {});
   const saveSnapshot = useMutation(api.scheduler.saveSnapshot);
+  const archiveSchedule = useMutation(api.scheduler.saveScheduleHistory);
 
   useEffect(() => {
     if (snapshot === undefined || hasHydrated.current) {
@@ -141,10 +221,66 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     const timeout = window.setTimeout(() => {
       hasHydrated.current = true;
       skipNextSave.current = true;
-      setData(snapshot);
+      setData({
+        people: snapshot.people,
+        tasks: snapshot.tasks,
+        chores: snapshot.chores,
+        weights: {
+          ...snapshot.weights,
+          chores: Object.fromEntries(
+            snapshot.choreTypes.map(({ name, weight }) => [name, weight]),
+          ),
+          tasks: Object.fromEntries(
+            snapshot.dutyTypes.map(({ name, weight }) => [name, weight]),
+          ),
+        },
+        rules: {
+          chores: Object.fromEntries(
+            snapshot.choreTypes.map(({ name, onePerMemberPerDay }) => [
+              name,
+              { onePerMemberPerDay },
+            ]),
+          ),
+          tasks: Object.fromEntries(
+            snapshot.dutyTypes.map(
+              ({ name, restriction, allowedChores }) => [
+                name,
+                { restriction, allowedChores },
+              ],
+            ),
+          ),
+        },
+        memberConstraints: Object.fromEntries(
+          snapshot.memberConstraints.map(
+            ({ member, blockedDuties, blockedChores, daysOff }) => [
+              member,
+              { blockedDuties, blockedChores, daysOff },
+            ],
+          ),
+        ),
+      });
+      setSavedAssignments(
+        mapWeek((day) => snapshot.assignments[day].map(({ member }) => member)),
+      );
+      setPersistedAssignments(
+        mapWeek((day) => snapshot.assignments[day].map(({ member }) => member)),
+      );
       setLoaded(true);
     }, 0);
     return () => window.clearTimeout(timeout);
+  }, [snapshot]);
+
+  useEffect(() => {
+    if (!hasHydrated.current || snapshot === undefined) {
+      return;
+    }
+    const next = mapWeek((day) =>
+      snapshot.assignments[day].map(({ member }) => member),
+    );
+    setPersistedAssignments(next);
+    if (!hasDraftChanges.current) {
+      setSavedAssignments(next);
+    }
   }, [snapshot]);
 
   useEffect(() => {
@@ -154,12 +290,16 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     }
 
     const timeout = window.setTimeout(async () => {
-      setSaving(true);
       try {
         await saveSnapshot({
           members: data.people,
           choreTypes: Object.entries(data.weights.chores).map(
-            ([name, weight]) => ({ name, weight }),
+            ([name, weight]) => ({
+              name,
+              weight,
+              onePerMemberPerDay:
+                data.rules.chores?.[name]?.onePerMemberPerDay ?? false,
+            }),
           ),
           dutyTypes: Object.entries(data.weights.tasks).map(
             ([name, weight]) => {
@@ -189,6 +329,14 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
                 duty: entry.task.trim(),
               })),
           ),
+          memberConstraints: Object.entries(data.memberConstraints).map(
+            ([member, constraint]) => ({
+              member,
+              blockedDuties: [...constraint.blockedDuties],
+              blockedChores: [...constraint.blockedChores],
+              daysOff: [...(constraint.daysOff ?? [])],
+            }),
+          ),
           defaultChoreWeight: data.weights.defaultChoreWeight,
           defaultDutyWeight: data.weights.defaultTaskWeight,
         });
@@ -202,33 +350,148 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
       } finally {
         setSaving(false);
       }
-    }, 500);
+    }, 300);
+    setSaving(true);
     return () => window.clearTimeout(timeout);
   }, [data, loaded, saveSnapshot]);
 
-  const tasks = useMemo(() => toWeeklyTasks(data.tasks), [data.tasks]);
-  const assignments = useMemo(
-    () =>
-      assignWeeklyChores(
+  function generateSchedule(): GeneratedSchedule {
+    const tasks = toWeeklyTasks(data.tasks);
+    const assignments = assignWeeklyChores(
+      data.people,
+      tasks,
+      data.chores,
+      data.weights,
+      data.rules,
+      data.memberConstraints,
+    );
+    return {
+      assignments,
+      workloads: calculateWeeklyWorkloads(
         data.people,
         tasks,
-        data.chores,
+        assignments,
         data.weights,
-        data.rules,
       ),
-    [data.people, data.chores, data.weights, data.rules, tasks],
-  );
-  const workloads = useMemo(
-    () =>
-      calculateWeeklyWorkloads(data.people, tasks, assignments, data.weights),
-    [data.people, data.weights, assignments, tasks],
-  );
+      people: [...data.people],
+      weights: data.weights,
+    };
+  }
+
+  function createManualSchedule(): GeneratedSchedule {
+    const assignments = mapWeek((day) =>
+      data.chores[day].map((chore, index) => ({
+        chore,
+        member: savedAssignments[day][index] ?? null,
+      })),
+    ) as WeeklyChoreAssignments;
+    const tasks = toWeeklyTasks(data.tasks);
+    return {
+      assignments,
+      workloads: calculateWeeklyWorkloads(
+        data.people,
+        tasks,
+        assignments,
+        data.weights,
+      ),
+      people: [...data.people],
+      weights: data.weights,
+    };
+  }
+
+  async function saveScheduleHistory(
+    assignments: WeeklyChoreAssignments,
+  ): Promise<boolean> {
+    try {
+      await archiveSchedule({
+        assignments: weekDays.flatMap((day) =>
+          assignments[day].map(({ chore, member }) => ({ day, chore, member })),
+        ),
+      });
+      const assignmentsByDay = mapWeek((day) =>
+        assignments[day].map(({ member }) => member),
+      );
+      setSavedAssignments(assignmentsByDay);
+      setPersistedAssignments(assignmentsByDay);
+      hasDraftChanges.current = false;
+      setError(null);
+      return true;
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error
+          ? `Could not save this week: ${saveError.message}`
+          : "Could not save this week.",
+      );
+      return false;
+    }
+  }
+
+  async function setChoreAssignment(
+    day: Weekday,
+    index: number,
+    member: string | null,
+  ): Promise<boolean> {
+    const chore = data.chores[day][index];
+    if (chore === undefined) {
+      setError("That chore is no longer on the schedule. Reload and try again.");
+      return false;
+    }
+    if (
+      member !== null &&
+      (!data.people.includes(member) ||
+        !canAssignChore(
+          member,
+          day,
+          chore,
+          toWeeklyTasks(data.tasks),
+          data.rules,
+          data.memberConstraints,
+          data.chores[day]
+            .map((assignmentChore, assignmentIndex) => ({
+              chore: assignmentChore,
+              member:
+                assignmentIndex === index
+                  ? null
+                  : savedAssignments[day][assignmentIndex] ?? null,
+            })),
+        ))
+    ) {
+      setError(
+        `${member} is not eligible for "${chore}" on ${day}.`,
+      );
+      return false;
+    }
+
+    setSavedAssignments((current) => ({
+      ...current,
+      [day]: current[day].map((savedMember, assignmentIndex) =>
+        assignmentIndex === index ? member : savedMember,
+      ),
+    }));
+    hasDraftChanges.current = true;
+    setError(null);
+    return true;
+  }
 
   function setMemberName(index: number, name: string) {
+    const previousName = data.people[index];
+    setSavedAssignments((assignments) =>
+      mapWeek((day) =>
+        assignments[day].map((member) =>
+          member === previousName ? name : member,
+        ),
+      ),
+    );
+    hasDraftChanges.current = true;
     setData((current) => {
-      const previousName = current.people[index];
+      const memberConstraints = { ...current.memberConstraints };
+      if (previousName !== name && memberConstraints[previousName]) {
+        memberConstraints[name] = memberConstraints[previousName];
+        delete memberConstraints[previousName];
+      }
       return {
         ...current,
+        memberConstraints,
         people: current.people.map((member, memberIndex) =>
           memberIndex === index ? name : member,
         ),
@@ -246,12 +509,23 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   }
 
   function removeMember(index: number) {
+    const removed = data.people[index];
+    setSavedAssignments((assignments) =>
+      mapWeek((day) =>
+        assignments[day].map((member) => (member === removed ? null : member)),
+      ),
+    );
+    hasDraftChanges.current = true;
     setData((current) => {
-      const removed = current.people[index];
       return {
         ...current,
         people: current.people.filter(
           (_, memberIndex) => memberIndex !== index,
+        ),
+        memberConstraints: Object.fromEntries(
+          Object.entries(current.memberConstraints).filter(
+            ([name]) => name !== removed,
+          ),
         ),
         tasks: mapWeek((day) =>
           current.tasks[day].filter((entry) => entry.member !== removed),
@@ -260,7 +534,157 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     });
   }
 
+  function setMemberConstraint(
+    member: string,
+    category: "blockedDuties" | "blockedChores",
+    name: string,
+    blocked: boolean,
+  ) {
+    if (blocked) {
+      const conflicts =
+        category === "blockedDuties"
+          ? weekDays.some((day) =>
+              data.tasks[day].some(
+                (entry) => entry.member === member && entry.task === name,
+              ),
+            )
+          : weekDays.some((day) =>
+              data.chores[day].some(
+                (chore, index) =>
+                  chore === name && savedAssignments[day][index] === member,
+              ),
+            );
+      if (conflicts) {
+        setError(
+          `Remove ${member} from "${name}" in the current schedule before blocking it.`,
+        );
+        return;
+      }
+    }
+    setError(null);
+    setData((current) => {
+      const constraint = current.memberConstraints[member] ?? {
+        blockedDuties: [],
+        blockedChores: [],
+      };
+      const names = new Set(constraint[category]);
+      if (blocked) {
+        names.add(name);
+      } else {
+        names.delete(name);
+      }
+      return {
+        ...current,
+        memberConstraints: {
+          ...current.memberConstraints,
+          [member]: { ...constraint, [category]: [...names] },
+        },
+      };
+    });
+  }
+
+  function setMemberDayOff(member: string, day: Weekday, isOff: boolean) {
+    if (
+      isOff &&
+      data.tasks[day].some((entry) => entry.member === member)
+    ) {
+      setError(
+        `Remove ${member}'s duty on ${day} before marking them unavailable.`,
+      );
+      return;
+    }
+    if (
+      isOff &&
+      data.chores[day].some((_, index) => savedAssignments[day][index] === member)
+    ) {
+      setError(`Unassign ${member}'s chores on ${day} before marking them off.`);
+      return;
+    }
+    setError(null);
+    setData((current) => {
+      const constraint = current.memberConstraints[member] ?? {
+        blockedDuties: [],
+        blockedChores: [],
+        daysOff: [],
+      };
+      const daysOff = new Set(constraint.daysOff ?? []);
+      if (isOff) {
+        daysOff.add(day);
+      } else {
+        daysOff.delete(day);
+      }
+      return {
+        ...current,
+        memberConstraints: {
+          ...current.memberConstraints,
+          [member]: { ...constraint, daysOff: [...daysOff] },
+        },
+      };
+    });
+  }
+
+  function setChoreRestriction(name: string, onePerMemberPerDay: boolean) {
+    const rules = {
+      ...data.rules,
+      chores: {
+        ...data.rules.chores,
+        [name]: { onePerMemberPerDay },
+      },
+    };
+    if (
+      hasAssignmentConflict(
+        data,
+        savedAssignments,
+        data.tasks,
+        data.chores,
+        rules,
+      )
+    ) {
+      setError(
+        "Unassign conflicting chores before changing this chore restriction.",
+      );
+      return;
+    }
+    if (onePerMemberPerDay) {
+      const duplicateConflict = weekDays.some((day) => {
+        const assigned = data.chores[day]
+          .map((chore, index) => ({
+            chore,
+            member: savedAssignments[day][index],
+          }))
+          .filter(
+            (entry): entry is { chore: string; member: string } =>
+              entry.member !== null,
+          );
+        return assigned.some((assignment) => {
+          const sameMember = assigned.filter(
+            (entry) => entry.member === assignment.member,
+          );
+          return (
+            sameMember.length > 1 &&
+            sameMember.some(
+              (entry) =>
+                entry.chore === name ||
+                data.rules.chores?.[entry.chore]?.onePerMemberPerDay,
+            )
+          );
+        });
+      });
+      if (duplicateConflict) {
+        setError(
+          "Unassign duplicate chores before requiring one-per-member-per-day.",
+        );
+        return;
+      }
+    }
+    setData((current) => ({ ...current, rules }));
+    setError(null);
+  }
+
   function addChore(day: Weekday) {
+    if (!Object.keys(data.weights.chores).length) {
+      return;
+    }
     setData((current) => {
       const firstType = Object.keys(current.weights.chores)[0];
       return firstType
@@ -273,18 +697,29 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
           }
         : current;
     });
+    setSavedAssignments((current) => ({
+      ...current,
+      [day]: [...current[day], null],
+    }));
+    hasDraftChanges.current = true;
   }
 
   function setChore(day: Weekday, index: number, name: string) {
+    const chores = {
+      ...data.chores,
+      [day]: data.chores[day].map((chore, choreIndex) =>
+        choreIndex === index ? name : chore,
+      ),
+    };
+    if (hasAssignmentConflict(data, savedAssignments, data.tasks, chores)) {
+      setError("Unassign this chore before changing it to a type the member cannot do.");
+      return;
+    }
     setData((current) => ({
       ...current,
-      chores: {
-        ...current.chores,
-        [day]: current.chores[day].map((chore, choreIndex) =>
-          choreIndex === index ? name : chore,
-        ),
-      },
+      chores,
     }));
+    setError(null);
   }
 
   function removeChore(day: Weekday, index: number) {
@@ -297,6 +732,13 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
         ),
       },
     }));
+    setSavedAssignments((current) => ({
+      ...current,
+      [day]: current[day].filter(
+        (_, assignmentIndex) => assignmentIndex !== index,
+      ),
+    }));
+    hasDraftChanges.current = true;
   }
 
   function addDuty(day: Weekday) {
@@ -320,15 +762,36 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     key: keyof TaskEntry,
     value: string,
   ) {
+    const currentEntry = data.tasks[day][index];
+    if (
+      (key === "member" &&
+        data.memberConstraints[value]?.daysOff?.includes(day)) ||
+      (key === "member" &&
+        data.memberConstraints[value]?.blockedDuties.includes(
+          currentEntry?.task ?? "",
+        )) ||
+      (key === "task" &&
+        currentEntry?.member &&
+        data.memberConstraints[currentEntry.member]?.blockedDuties.includes(value))
+    ) {
+      setError("This member is not allowed to perform that duty.");
+      return;
+    }
+    const tasks = {
+      ...data.tasks,
+      [day]: data.tasks[day].map((entry, taskIndex) =>
+        taskIndex === index ? { ...entry, [key]: value } : entry,
+      ),
+    };
+    if (hasAssignmentConflict(data, savedAssignments, tasks)) {
+      setError("This duty change conflicts with a saved chore assignment.");
+      return;
+    }
     setData((current) => ({
       ...current,
-      tasks: {
-        ...current.tasks,
-        [day]: current.tasks[day].map((entry, taskIndex) =>
-          taskIndex === index ? { ...entry, [key]: value } : entry,
-        ),
-      },
+      tasks,
     }));
+    setError(null);
   }
 
   function removeDuty(day: Weekday, index: number) {
@@ -369,7 +832,13 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
                   [cleanName]: { restriction: "none", allowedChores: [] },
                 },
               }
-            : current.rules,
+            : {
+                ...current.rules,
+                chores: {
+                  ...current.rules.chores,
+                  [cleanName]: { onePerMemberPerDay: false },
+                },
+              },
       };
     });
   }
@@ -399,8 +868,27 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
         ]),
       );
       const choreNames = category === "chores";
+      const memberConstraints = Object.fromEntries(
+        Object.entries(current.memberConstraints).map(([member, constraint]) => [
+          member,
+          choreNames
+            ? {
+                ...constraint,
+                blockedChores: constraint.blockedChores.map((chore) =>
+                  chore === oldName ? name : chore,
+                ),
+              }
+            : {
+                ...constraint,
+                blockedDuties: constraint.blockedDuties.map((duty) =>
+                  duty === oldName ? name : duty,
+                ),
+              },
+        ]),
+      );
       return {
         ...current,
+        memberConstraints,
         weights: { ...current.weights, [category]: weights },
         chores: choreNames
           ? mapWeek((day) =>
@@ -417,6 +905,16 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
             )
           : current.tasks,
         rules: {
+            chores: choreNames
+              ? Object.fromEntries(
+                  Object.entries(current.rules.chores ?? {}).map(
+                    ([chore, rule]) => [
+                      chore === oldName ? name : chore,
+                      rule,
+                    ],
+                  ),
+                )
+              : current.rules.chores,
           tasks: choreNames
             ? Object.fromEntries(
                 Object.entries(current.rules.tasks).map(([task, rule]) => [
@@ -455,11 +953,39 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   }
 
   function removeType(category: "chores" | "tasks", name: string) {
+    if (category === "chores") {
+      setSavedAssignments((assignments) =>
+        mapWeek((day) =>
+          assignments[day].filter(
+            (_, index) => data.chores[day][index] !== name,
+          ),
+        ),
+      );
+      hasDraftChanges.current = true;
+    }
     setData((current) => {
       const weights = { ...current.weights[category] };
       delete weights[name];
       return {
         ...current,
+        memberConstraints: Object.fromEntries(
+          Object.entries(current.memberConstraints).map(([member, constraint]) => [
+            member,
+            category === "chores"
+              ? {
+                  ...constraint,
+                  blockedChores: constraint.blockedChores.filter(
+                    (chore) => chore !== name,
+                  ),
+                }
+              : {
+                  ...constraint,
+                  blockedDuties: constraint.blockedDuties.filter(
+                    (duty) => duty !== name,
+                  ),
+                },
+          ]),
+        ),
         weights: { ...current.weights, [category]: weights },
         chores:
           category === "chores"
@@ -474,6 +1000,14 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
               )
             : current.tasks,
         rules: {
+          chores:
+            category === "chores"
+              ? Object.fromEntries(
+                  Object.entries(current.rules.chores ?? {}).filter(
+                    ([chore]) => chore !== name,
+                  ),
+                )
+              : current.rules.chores,
           tasks:
             category === "tasks"
               ? Object.fromEntries(
@@ -508,21 +1042,46 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   }
 
   function setTaskRestriction(name: string, restriction: TaskRestriction) {
-    setData((current) => ({
-      ...current,
-      rules: {
-        tasks: {
-          ...current.rules.tasks,
-          [name]: {
-            ...(current.rules.tasks[name] ?? { allowedChores: [] }),
-            restriction,
-          },
+    const rules = {
+      tasks: {
+        ...data.rules.tasks,
+        [name]: {
+          ...(data.rules.tasks[name] ?? { allowedChores: [] }),
+          restriction,
         },
       },
+    };
+    if (hasAssignmentConflict(data, savedAssignments, data.tasks, data.chores, rules)) {
+      setError("This duty restriction conflicts with a saved chore assignment.");
+      return;
+    }
+    setData((current) => ({
+      ...current,
+      rules,
     }));
+    setError(null);
   }
 
   function setAllowedChore(task: string, chore: string, allowed: boolean) {
+    const currentRule = data.rules.tasks[task] ?? {
+      restriction: "none" as const,
+      allowedChores: [],
+    };
+    const rules = {
+      tasks: {
+        ...data.rules.tasks,
+        [task]: {
+          ...currentRule,
+          allowedChores: allowed
+            ? [...new Set([...currentRule.allowedChores, chore])]
+            : currentRule.allowedChores.filter((name) => name !== chore),
+        },
+      },
+    };
+    if (hasAssignmentConflict(data, savedAssignments, data.tasks, data.chores, rules)) {
+      setError("This chore rule conflicts with a saved chore assignment.");
+      return;
+    }
     setData((current) => {
       const rule = current.rules.tasks[task] ?? {
         restriction: "none" as const,
@@ -531,6 +1090,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
       return {
         ...current,
         rules: {
+          chores: current.rules.chores,
           tasks: {
             ...current.rules.tasks,
             [task]: {
@@ -543,18 +1103,34 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
         },
       };
     });
+    setError(null);
+  }
+
+  function reset() {
+    setData(createEmptySchedule());
+    setSavedAssignments(mapWeek(() => []));
+    hasDraftChanges.current = true;
+    setError(null);
   }
 
   const value: SchedulerContextValue = {
     data,
-    assignments,
-    workloads,
+    savedAssignments,
+    persistedAssignments,
+    savedSchedules: savedSchedules ?? [],
+    generateSchedule,
+    createManualSchedule,
+    saveScheduleHistory,
+    setChoreAssignment,
     loaded,
     saving,
     error,
     setMemberName,
     addMember,
     removeMember,
+    setMemberConstraint,
+    setMemberDayOff,
+    setChoreRestriction,
     addChore,
     setChore,
     removeChore,
@@ -568,7 +1144,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     setDefaultWeight,
     setTaskRestriction,
     setAllowedChore,
-    reset: () => setData(createEmptySchedule()),
+    reset,
   };
 
   return (

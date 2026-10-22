@@ -3,9 +3,24 @@
 import { Plus, Trash2 } from "lucide-react";
 import { useScheduler } from "@/app/scheduler-context";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { type Weekday } from "@/lib/types";
-import { SectionCard } from "@/app/(schedule)/components/ui";
+import { SectionCard } from "@/app/(schedule)/_components/ui";
 import { dayNames } from "@/lib/types";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 export function DutyDayEditor({ day }: { day: Weekday }) {
   const { data, addDuty, setDuty, removeDuty } = useScheduler();
@@ -25,47 +40,86 @@ export function DutyDayEditor({ day }: { day: Weekday }) {
           Add duty
         </Button>
       </div>
-      <div className="space-y-3">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Member</TableHead>
+            <TableHead>Duty</TableHead>
+            <TableHead className="w-16">Remove</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
         {data.tasks[day].map((entry, index) => (
-          <div
-            className="grid gap-2 sm:grid-cols-[1fr_1fr_auto]"
+          <TableRow
             key={`${day}-task-${index}`}
           >
-            <label className="space-y-1 text-xs font-medium text-muted-foreground">
-              Member
-              <select
-                className="border-input focus-visible:border-ring focus-visible:ring-ring/50 h-9 w-full rounded-md border bg-background px-3 text-sm font-normal text-foreground outline-none focus-visible:ring-[3px]"
-                value={entry.member}
-                onChange={(event) =>
-                  setDuty(day, index, "member", event.currentTarget.value)
+            <TableCell>
+              <Select
+                value={entry.member || "__unassigned"}
+                onValueChange={(value) =>
+                  setDuty(
+                    day,
+                    index,
+                    "member",
+                    value === "__unassigned" ? "" : value ?? "",
+                  )
                 }
               >
-                <option value="">Select member</option>
-                {data.people.map((person, personIndex) => (
-                  <option key={`${person}-${personIndex}`} value={person}>
-                    {person || "Unnamed member"}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="space-y-1 text-xs font-medium text-muted-foreground">
-              Duty
-              <select
-                aria-label={`${dayNames[day]} duty ${index + 1}`}
-                className="border-input focus-visible:border-ring focus-visible:ring-ring/50 h-9 w-full rounded-md border bg-background px-3 text-sm font-normal text-foreground outline-none focus-visible:ring-[3px]"
+                <SelectTrigger aria-label={`${dayNames[day]} duty member ${index + 1}`} className="w-full">
+                  <SelectValue placeholder="Select member" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__unassigned">Select member</SelectItem>
+                {data.people
+                  .filter(
+                    (person) =>
+                      person === entry.member ||
+                      data.memberConstraints[person]?.daysOff?.includes(day) !== true &&
+                      !data.memberConstraints[
+                        person
+                      ]?.blockedDuties.includes(entry.task),
+                  )
+                  .map((person, personIndex) => (
+                    <SelectItem key={`${person}-${personIndex}`} value={person}>
+                      {person || "Unnamed member"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </TableCell>
+            <TableCell>
+              <Select
                 value={entry.task}
-                onChange={(event) =>
-                  setDuty(day, index, "task", event.currentTarget.value)
-                }
+                onValueChange={(value) => {
+                  if (typeof value === "string") {
+                    setDuty(day, index, "task", value);
+                  }
+                }}
               >
-                {dutyTypes.map((name) => (
-                  <option value={name} key={name}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="flex items-end">
+                <SelectTrigger
+                  aria-label={`${dayNames[day]} duty ${index + 1}`}
+                  className="w-full"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {dutyTypes
+                    .filter(
+                      (name) =>
+                        name === entry.task ||
+                        !data.memberConstraints[
+                          entry.member
+                        ]?.blockedDuties.includes(name),
+                    )
+                    .map((name) => (
+                    <SelectItem value={name} key={name}>
+                      {name}
+                    </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </TableCell>
+            <TableCell>
               <Button
                 variant="ghost"
                 size="icon"
@@ -74,15 +128,18 @@ export function DutyDayEditor({ day }: { day: Weekday }) {
               >
                 <Trash2 />
               </Button>
-            </div>
-          </div>
+            </TableCell>
+          </TableRow>
         ))}
         {!data.tasks[day].length && (
-          <p className="text-sm text-muted-foreground">
-            No duties recorded for this day.
-          </p>
+          <TableRow>
+            <TableCell colSpan={3} className="text-center text-muted-foreground">
+              No duties recorded for this day.
+            </TableCell>
+          </TableRow>
         )}
-      </div>
+        </TableBody>
+      </Table>
     </SectionCard>
   );
 }

@@ -1,6 +1,8 @@
 import { DutyDayEditor } from "@/app/(schedule)/duties/editor";
 import { weekDays } from "@/lib/types";
 
+export const instant = false;
+
 export default function DutiesPage() {
   return (
     <div className="space-y-4">

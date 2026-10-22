@@ -3,9 +3,29 @@
 import { Trash2 } from "lucide-react";
 import { useScheduler } from "@/app/scheduler-context";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import type { TaskRestriction } from "@/lib/types";
-import { NumberField } from "@/app/(schedule)/components/ui";
+import { NumberField } from "@/app/(schedule)/_components/ui";
+
+const restrictionLabels: Record<TaskRestriction, string> = {
+  none: "No chore restriction",
+  "unavailable-today": "Cannot do chores that day",
+  "unavailable-today-and-previous-day":
+    "Cannot do chores that day or the previous day",
+  "only-selected-chores": "Can only do selected chore types",
+};
+
+function isTaskRestriction(value: string): value is TaskRestriction {
+  return Object.hasOwn(restrictionLabels, value);
+}
 
 export function WeightEditor({
   name,
@@ -69,25 +89,25 @@ export function DutyTypeRule({
       </div>
       <label className="block space-y-1 text-sm font-medium">
         Assignment rule
-        <select
-          className="border-input focus-visible:border-ring focus-visible:ring-ring/50 h-9 w-full rounded-md border bg-background px-3 font-normal text-foreground outline-none focus-visible:ring-[3px]"
+        <Select
           value={restriction}
-          onChange={(event) =>
-            setTaskRestriction(
-              name,
-              event.currentTarget.value as TaskRestriction,
-            )
-          }
+          onValueChange={(value) => {
+            if (typeof value === "string" && isTaskRestriction(value)) {
+              setTaskRestriction(name, value);
+            }
+          }}
         >
-          <option value="none">No chore restriction</option>
-          <option value="unavailable-today">Cannot do chores that day</option>
-          <option value="unavailable-today-and-previous-day">
-            Cannot do chores that day or the previous day
-          </option>
-          <option value="only-selected-chores">
-            Can only do selected chore types
-          </option>
-        </select>
+          <SelectTrigger className="w-full font-normal">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {Object.entries(restrictionLabels).map(([value, label]) => (
+              <SelectItem value={value} key={value}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </label>
       {restriction === "only-selected-chores" && (
         <fieldset className="space-y-2">
@@ -98,11 +118,10 @@ export function DutyTypeRule({
             <div className="flex flex-wrap gap-3">
               {choreTypes.map((chore) => (
                 <label className="flex items-center gap-2 text-sm" key={chore}>
-                  <input
-                    type="checkbox"
+                  <Checkbox
                     checked={allowedChores.includes(chore)}
-                    onChange={(event) =>
-                      setAllowedChore(name, chore, event.currentTarget.checked)
+                    onCheckedChange={(checked) =>
+                      setAllowedChore(name, chore, checked === true)
                     }
                   />
                   {chore}

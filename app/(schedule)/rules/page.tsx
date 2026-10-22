@@ -4,9 +4,19 @@ import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { useScheduler } from "@/app/scheduler-context";
 import { Button } from "@/components/ui/button";
+import { Form } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
-import { NumberField, SectionCard } from "@/app/(schedule)/components/ui";
+import { Checkbox } from "@/components/ui/checkbox";
+import { NumberField, SectionCard } from "@/app/(schedule)/_components/ui";
 import { DutyTypeRule, WeightEditor } from "./components";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 export default function RulesPage() {
   const {
@@ -16,6 +26,7 @@ export default function RulesPage() {
     setTypeWeight,
     removeType,
     setDefaultWeight,
+    setChoreRestriction,
   } = useScheduler();
   const [newChore, setNewChore] = useState("");
   const [newDuty, setNewDuty] = useState("");
@@ -37,10 +48,9 @@ export default function RulesPage() {
             These types become available for each day&apos;s chore schedule.
           </p>
         </div>
-        <form
+        <Form
           className="mb-4 grid gap-2 sm:grid-cols-[1fr_auto]"
-          onSubmit={(event) => {
-            event.preventDefault();
+          onFormSubmit={() => {
             addType("chores", newChore);
             setNewChore("");
           }}
@@ -55,38 +65,69 @@ export default function RulesPage() {
             <Plus data-icon="inline-start" />
             Add chore type
           </Button>
-        </form>
-        <div className="space-y-3">
+        </Form>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Chore type</TableHead>
+              <TableHead>Points</TableHead>
+              <TableHead>Daily limit</TableHead>
+              <TableHead className="w-16">Remove</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
           {Object.entries(data.weights.chores).map(([name, weight]) => (
-            <div className="grid gap-2 sm:grid-cols-[1fr_auto_auto]" key={name}>
-              <Input
-                aria-label="Chore type name"
-                value={name}
-                onChange={(event) =>
-                  renameType("chores", name, event.currentTarget.value)
-                }
-              />
-              <WeightEditor
-                name={name}
-                weight={weight}
-                onChange={(value) => setTypeWeight("chores", name, value)}
-              />
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label={`Remove ${name} chore type`}
-                onClick={() => removeType("chores", name)}
-              >
-                <Trash2 />
-              </Button>
-            </div>
+            <TableRow key={name}>
+              <TableCell>
+                <Input
+                  aria-label="Chore type name"
+                  value={name}
+                  onChange={(event) =>
+                    renameType("chores", name, event.currentTarget.value)
+                  }
+                />
+              </TableCell>
+              <TableCell>
+                <WeightEditor
+                  name={name}
+                  weight={weight}
+                  onChange={(value) => setTypeWeight("chores", name, value)}
+                />
+              </TableCell>
+              <TableCell>
+                <label className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    checked={
+                      data.rules.chores?.[name]?.onePerMemberPerDay ?? false
+                    }
+                    onCheckedChange={(checked) =>
+                      setChoreRestriction(name, checked === true)
+                    }
+                  />
+                  One per member per day
+                </label>
+              </TableCell>
+              <TableCell>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Remove ${name} chore type`}
+                  onClick={() => removeType("chores", name)}
+                >
+                  <Trash2 />
+                </Button>
+              </TableCell>
+            </TableRow>
           ))}
           {!Object.keys(data.weights.chores).length && (
-            <p className="text-sm text-muted-foreground">
-              No chore types created yet.
-            </p>
+            <TableRow>
+              <TableCell colSpan={4} className="text-center text-muted-foreground">
+                No chore types created yet.
+              </TableCell>
+            </TableRow>
           )}
-        </div>
+          </TableBody>
+        </Table>
       </SectionCard>
 
       <SectionCard>
@@ -97,10 +138,9 @@ export default function RulesPage() {
             behavior unless you set one here.
           </p>
         </div>
-        <form
+        <Form
           className="mb-4 grid gap-2 sm:grid-cols-[1fr_auto]"
-          onSubmit={(event) => {
-            event.preventDefault();
+          onFormSubmit={() => {
             addType("tasks", newDuty);
             setNewDuty("");
           }}
@@ -115,7 +155,7 @@ export default function RulesPage() {
             <Plus data-icon="inline-start" />
             Add duty type
           </Button>
-        </form>
+        </Form>
         <div className="space-y-4">
           {Object.entries(data.weights.tasks).map(([name, weight]) => {
             const rule = data.rules.tasks[name] ?? {

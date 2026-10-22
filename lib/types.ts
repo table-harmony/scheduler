@@ -53,7 +53,23 @@ export type TaskRule = {
 
 export type SchedulingRules = {
   tasks: Readonly<Record<string, TaskRule>>;
+  chores?: Readonly<Record<string, ChoreRule>>;
 };
+
+export type ChoreRule = {
+  onePerMemberPerDay: boolean;
+};
+
+export type MemberConstraints = Readonly<
+  Record<
+    string,
+    {
+      blockedDuties: readonly string[];
+      blockedChores: readonly string[];
+      daysOff?: readonly Weekday[];
+    }
+  >
+>;
 
 export const defaultWorkloadWeights: WorkloadWeights = {
   chores: {},

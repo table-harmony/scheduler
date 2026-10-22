@@ -1,6 +1,6 @@
 import {
   type SchedulingRules,
-  type TaskRule,
+  type MemberConstraints,
   type WeeklyChoreAssignments,
   type WeeklyChores,
   type WeeklyTasks,
@@ -8,19 +8,10 @@ import {
   defaultWorkloadWeights,
   weekDays,
 } from "@/lib/types";
+import { canAssignChore } from "@/lib/choreEligibility";
 
 function normalizeWeightKey(value: string): string {
   return value.toLowerCase().replace(/\s+/g, " ").trim();
-}
-
-function getTaskRule(
-  rules: SchedulingRules,
-  task: string,
-): TaskRule | undefined {
-  const normalizedTask = normalizeWeightKey(task);
-  return Object.entries(rules.tasks).find(
-    ([name]) => normalizeWeightKey(name) === normalizedTask,
-  )?.[1];
 }
 
 function getWeight(
@@ -47,6 +38,7 @@ export function assignWeeklyChores(
   chores: WeeklyChores,
   weights: WorkloadWeights = defaultWorkloadWeights,
   rules: SchedulingRules = { tasks: {} },
+  memberConstraints: MemberConstraints = {},
 ): WeeklyChoreAssignments {
   const members = [...new Set(people.filter((person) => person.trim()))];
   const memberIndex = new Map(members.map((member, index) => [member, index]));
@@ -75,67 +67,67 @@ export function assignWeeklyChores(
   };
   let tieBreaker = 0;
 
-  for (const [dayIndex, day] of weekDays.entries()) {
-    const dayTasks = tasks[day] ?? {};
-    const unavailableToday = new Set<string>();
-    const allowedChoresToday = new Map<string, Set<string>>();
-
-    for (const [member, memberTasks] of Object.entries(dayTasks)) {
-      for (const task of memberTasks) {
-        const taskRule = getTaskRule(rules, task);
-        const restriction = taskRule?.restriction ?? "none";
-        if (
-          restriction === "unavailable-today" ||
-          restriction === "unavailable-today-and-previous-day"
-        ) {
-          unavailableToday.add(member);
-        } else if (restriction === "only-selected-chores") {
-          const allowedForTask = new Set(
-            (taskRule?.allowedChores ?? []).map(normalizeWeightKey),
-          );
-          const allowedForMember = allowedChoresToday.get(member);
-          if (allowedForMember) {
-            for (const chore of allowedForMember) {
-              if (!allowedForTask.has(chore)) {
-                allowedForMember.delete(chore);
-              }
-            }
-          } else {
-            allowedChoresToday.set(member, allowedForTask);
-          }
-        }
-      }
-    }
-
-    const nextDay = weekDays[dayIndex + 1];
-    if (nextDay) {
-      for (const [member, memberTasks] of Object.entries(
-        tasks[nextDay] ?? {},
-      )) {
-        if (
-          memberTasks.some((task) => {
-            const restriction = getTaskRule(rules, task)?.restriction;
-            return restriction === "unavailable-today-and-previous-day";
-          })
-        ) {
-          unavailableToday.add(member);
-        }
-      }
-    }
-
+  for (const day of weekDays) {
     const dayChores = (chores[day] ?? [])
       .map((chore) => chore.trim())
       .filter(Boolean);
     const choreWeights = dayChores.map((chore) =>
       getWeight(chore, weights.chores, weights.defaultChoreWeight),
     );
-    const candidatesByChore = dayChores.map((chore) =>
-      members
-        .filter(
-          (member) =>
-            !unavailableToday.has(member) &&
-            (!allowedChoresToday.has(member) ||
-              allowedChoresToday.get(member)?.has(normalizeWeightKey(chore))),
+    const choreOrder = dayChores
+      .map((_, index) => index)
+      .sort(
+        (left, right) => {
+          const leftChore = dayChores[left];
+          const rightChore = dayChores[right];
+          const leftCandidateCount = members.filter((member) =>
+            canAssignChore(
+              member,
+              day,
+              leftChore,
+              tasks,
+              rules,
+              memberConstraints,
+            ),
+          ).length;
+          const rightCandidateCount = members.filter((member) =>
+            canAssignChore(
+              member,
+              day,
+              rightChore,
+              tasks,
+              rules,
+              memberConstraints,
+            ),
+          ).length;
+          return (
+            Number(
+              rules.chores?.[rightChore]?.onePerMemberPerDay ?? false,
+            ) -
+              Number(
+                rules.chores?.[leftChore]?.onePerMemberPerDay ?? false,
+              ) ||
+            leftCandidateCount - rightCandidateCount ||
+            choreWeights[right] - choreWeights[left]
+          );
+        },
+      );
+    const assignments: WeeklyChoreAssignments[Weekday] = dayChores.map(
+      (chore) => ({ chore, member: null }),
+    );
+    for (const choreIndex of choreOrder) {
+      const chore = dayChores[choreIndex];
+      const candidates = members
+        .filter((member) =>
+          canAssignChore(
+            member,
+            day,
+            chore,
+            tasks,
+            rules,
+            memberConstraints,
+            assignments,
+          ),
         )
         .sort((left, right) => {
           const loadDifference =
@@ -143,7 +135,6 @@ export function assignWeeklyChores(
           if (loadDifference !== 0) {
             return loadDifference;
           }
-
           const leftIndex = memberIndex.get(left) ?? 0;
           const rightIndex = memberIndex.get(right) ?? 0;
           const leftPriority =
@@ -151,94 +142,18 @@ export function assignWeeklyChores(
           const rightPriority =
             (rightIndex - tieBreaker + members.length) % members.length;
           return leftPriority - rightPriority;
-        }),
-    );
-
-    const choreOrder = dayChores
-      .map((_, index) => index)
-      .sort(
-        (left, right) =>
-          candidatesByChore[left].length - candidatesByChore[right].length ||
-          choreWeights[right] - choreWeights[left],
-      );
-    const choreByMember = new Map<string, number>();
-
-    const placeChore = (choreIndex: number, visited: Set<string>): boolean => {
-      for (const member of candidatesByChore[choreIndex]) {
-        if (visited.has(member)) {
-          continue;
-        }
-        visited.add(member);
-
-        const previousChore = choreByMember.get(member);
-        if (previousChore === undefined || placeChore(previousChore, visited)) {
-          choreByMember.set(member, choreIndex);
-          return true;
-        }
-      }
-      return false;
-    };
-
-    for (const choreIndex of choreOrder) {
-      placeChore(choreIndex, new Set());
-    }
-
-    let improved = true;
-    while (improved) {
-      improved = false;
-      const assignments = [...choreByMember.entries()];
-
-      for (let first = 0; first < assignments.length; first++) {
-        for (let second = first + 1; second < assignments.length; second++) {
-          const [firstMember, firstChore] = assignments[first];
-          const [secondMember, secondChore] = assignments[second];
-          const firstCanTakeSecond =
-            candidatesByChore[secondChore].includes(firstMember);
-          const secondCanTakeFirst =
-            candidatesByChore[firstChore].includes(secondMember);
-
-          if (!firstCanTakeSecond || !secondCanTakeFirst) {
-            continue;
-          }
-
-          const firstLoad = weeklyLoad.get(firstMember) ?? 0;
-          const secondLoad = weeklyLoad.get(secondMember) ?? 0;
-          const currentSpread =
-            (firstLoad + choreWeights[firstChore]) ** 2 +
-            (secondLoad + choreWeights[secondChore]) ** 2;
-          const swappedSpread =
-            (firstLoad + choreWeights[secondChore]) ** 2 +
-            (secondLoad + choreWeights[firstChore]) ** 2;
-
-          if (swappedSpread < currentSpread) {
-            choreByMember.set(firstMember, secondChore);
-            choreByMember.set(secondMember, firstChore);
-            improved = true;
-            break;
-          }
-        }
-        if (improved) {
-          break;
-        }
-      }
-    }
-
-    const memberByChore = new Map<number, string>();
-    for (const [member, choreIndex] of choreByMember) {
-      memberByChore.set(choreIndex, member);
-    }
-
-    const assignments = dayChores.map((chore, choreIndex) => {
-      const member = memberByChore.get(choreIndex) ?? null;
+        });
+      const member = candidates[0] ?? null;
       if (member !== null) {
         weeklyLoad.set(
           member,
-          (weeklyLoad.get(member) ?? 0) + choreWeights[choreIndex],
+          (weeklyLoad.get(member) ?? 0) +
+            getWeight(chore, weights.chores, weights.defaultChoreWeight),
         );
         tieBreaker = ((memberIndex.get(member) ?? 0) + 1) % members.length;
       }
-      return { chore, member };
-    });
+      assignments[choreIndex] = { chore, member };
+    }
 
     result[day] = assignments;
   }
