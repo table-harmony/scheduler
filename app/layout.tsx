@@ -18,7 +18,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Weekly Scheduler",
-  description: "Balance weekly chores around member duties.",
+  description: "Plan chores, duties, and time off with your group.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -5,7 +5,7 @@ import {
   type Weekday,
 } from "../lib/types";
 import type { Id } from "./_generated/dataModel";
-import { mutation, query } from "./_generated/server";
+import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 
 const weekDay = v.union(
   v.literal("sunday"),
@@ -26,6 +26,7 @@ const taskRestriction = v.union(
 
 const snapshotValidator = {
   members: v.array(v.string()),
+  memberIds: v.array(v.union(v.id("members"), v.null())),
   choreTypes: v.array(
     v.object({
       name: v.string(),
@@ -42,12 +43,20 @@ const snapshotValidator = {
     }),
   ),
   chores: v.array(v.object({ day: weekDay, chore: v.string() })),
+  assignments: v.array(
+    v.object({
+      day: weekDay,
+      chore: v.string(),
+      member: v.union(v.string(), v.null()),
+    }),
+  ),
   duties: v.array(
     v.object({ day: weekDay, member: v.string(), duty: v.string() }),
   ),
   memberConstraints: v.array(
     v.object({
       member: v.string(),
+      memberId: v.union(v.id("members"), v.null()),
       blockedDuties: v.array(v.string()),
       blockedChores: v.array(v.string()),
       daysOff: v.array(weekDay),
@@ -57,26 +66,348 @@ const snapshotValidator = {
   defaultDutyWeight: v.number(),
 };
 
+function normalizedMemberName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+type AuthenticatedContext = QueryCtx | MutationCtx;
+
+async function getIdentity(ctx: AuthenticatedContext) {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) {
+    throw new Error("Sign in to continue.");
+  }
+  return identity;
+}
+
+async function getMembership(ctx: AuthenticatedContext, userId: string) {
+  return ctx.db
+    .query("groupMemberships")
+    .withIndex("by_user", (q) => q.eq("userId", userId))
+    .unique();
+}
+
+async function requireGroup(ctx: AuthenticatedContext) {
+  const identity = await getIdentity(ctx);
+  const membership = await getMembership(ctx, identity.subject);
+  if (!membership) {
+    throw new Error("Join or create a group to access its schedule.");
+  }
+  const group = await ctx.db.get(membership.groupId);
+  if (!group) {
+    throw new Error("This group no longer exists.");
+  }
+  return { identity, membership, group };
+}
+
+async function requireManager(ctx: AuthenticatedContext) {
+  const access = await requireGroup(ctx);
+  if (access.membership.role !== "manager") {
+    throw new Error("Only the group manager can edit the schedule.");
+  }
+  return access;
+}
+
+async function migrateLegacySchedule(
+  ctx: MutationCtx,
+  groupId: Id<"groups">,
+) {
+  const tables = [
+    "members",
+    "choreTypes",
+    "dutyTypes",
+    "chores",
+    "duties",
+    "memberConstraints",
+    "memberAbsences",
+    "savedSchedules",
+    "schedulerSettings",
+  ] as const;
+  for (const table of tables) {
+    const documents = await ctx.db.query(table).collect();
+    for (const document of documents) {
+      if (document.groupId === undefined) {
+        await ctx.db.patch(document._id, { groupId });
+      }
+    }
+  }
+}
+
+export const getMyGroup = query({
+  args: {},
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return null;
+    }
+    const membership = await getMembership(ctx, identity.subject);
+    if (!membership) {
+      return null;
+    }
+    const [group, member] = await Promise.all([
+      ctx.db.get(membership.groupId),
+      ctx.db.get(membership.memberId),
+    ]);
+    if (!group || !member) {
+      return null;
+    }
+    return {
+      id: group._id,
+      name: group.name,
+      inviteCode: group.inviteCode,
+      role: membership.role,
+      memberId: member._id,
+      memberName: member.name,
+    };
+  },
+});
+
+export const getGroupInvitePreview = query({
+  args: { inviteCode: v.string() },
+  handler: async (ctx, { inviteCode }) => {
+    await getIdentity(ctx);
+    if (!inviteCode.trim()) {
+      return null;
+    }
+    const group = await ctx.db
+      .query("groups")
+      .withIndex("by_invite_code", (q) => q.eq("inviteCode", inviteCode.trim()))
+      .unique();
+    if (!group) {
+      return null;
+    }
+    const [members, memberships] = await Promise.all([
+      ctx.db
+        .query("members")
+        .withIndex("by_group", (q) => q.eq("groupId", group._id))
+        .collect(),
+      ctx.db
+        .query("groupMemberships")
+        .withIndex("by_group", (q) => q.eq("groupId", group._id))
+        .collect(),
+    ]);
+    const claimedIds = new Set(memberships.map(({ memberId }) => memberId));
+    return {
+      id: group._id,
+      name: group.name,
+      unclaimedMembers: members
+        .filter((member) => !claimedIds.has(member._id))
+        .map(({ _id, name }) => ({ id: _id, name })),
+    };
+  },
+});
+
+export const createGroup = mutation({
+  args: {
+    name: v.string(),
+    memberName: v.string(),
+    inviteCode: v.string(),
+  },
+  handler: async (ctx, { name, memberName, inviteCode }) => {
+    const identity = await getIdentity(ctx);
+    if (await getMembership(ctx, identity.subject)) {
+      throw new Error("Your account already belongs to a group.");
+    }
+    const cleanName = name.trim();
+    const cleanMemberName = memberName.trim();
+    if (!cleanName || cleanName.length > 80) {
+      throw new Error("Group name must be between 1 and 80 characters.");
+    }
+    if (!cleanMemberName || cleanMemberName.length > 80) {
+      throw new Error("Member name must be between 1 and 80 characters.");
+    }
+    if (inviteCode.length < 32 || inviteCode.length > 80) {
+      throw new Error("Generate a valid group invite code.");
+    }
+    const existingCode = await ctx.db
+      .query("groups")
+      .withIndex("by_invite_code", (q) => q.eq("inviteCode", inviteCode))
+      .unique();
+    if (existingCode) {
+      throw new Error("Invite code collision. Please try again.");
+    }
+    const existingGroups = await ctx.db.query("groups").collect();
+    const groupId = await ctx.db.insert("groups", {
+      name: cleanName,
+      inviteCode,
+      createdBy: identity.subject,
+    });
+    if (existingGroups.length === 0) {
+      await migrateLegacySchedule(ctx, groupId);
+    }
+    const legacyMembers = await ctx.db
+      .query("members")
+      .withIndex("by_group", (q) => q.eq("groupId", groupId))
+      .collect();
+    const existingMember = legacyMembers.find(
+      (member) =>
+        normalizedMemberName(member.name) ===
+          normalizedMemberName(cleanMemberName) &&
+        !member.userId,
+    );
+    if (
+      legacyMembers.some(
+        (member) =>
+          normalizedMemberName(member.name) ===
+            normalizedMemberName(cleanMemberName) &&
+          member._id !== existingMember?._id,
+      )
+    ) {
+      throw new Error("Member names must be unique within a group.");
+    }
+    const memberId =
+      existingMember?._id ??
+      (await ctx.db.insert("members", {
+        groupId,
+        userId: identity.subject,
+        name: cleanMemberName,
+        daysOff: [],
+        daysOffRemaining: 0,
+      }));
+    if (existingMember) {
+      await ctx.db.patch(existingMember._id, { userId: identity.subject });
+    }
+    await ctx.db.insert("groupMemberships", {
+      groupId,
+      userId: identity.subject,
+      memberId,
+      role: "manager",
+      joinedAt: Date.now(),
+    });
+  },
+});
+
+export const joinGroup = mutation({
+  args: {
+    inviteCode: v.string(),
+    memberName: v.string(),
+    existingMemberId: v.optional(v.id("members")),
+  },
+  handler: async (ctx, { inviteCode, memberName, existingMemberId }) => {
+    const identity = await getIdentity(ctx);
+    if (await getMembership(ctx, identity.subject)) {
+      throw new Error("Your account already belongs to a group.");
+    }
+    const group = await ctx.db
+      .query("groups")
+      .withIndex("by_invite_code", (q) => q.eq("inviteCode", inviteCode.trim()))
+      .unique();
+    if (!group) {
+      throw new Error("That group invite code is invalid.");
+    }
+    const cleanMemberName = memberName.trim();
+    if (!existingMemberId && (!cleanMemberName || cleanMemberName.length > 80)) {
+      throw new Error("Member name must be between 1 and 80 characters.");
+    }
+    const groupMembers = await ctx.db
+      .query("members")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
+    let memberId: Id<"members">;
+    if (existingMemberId) {
+      const member = await ctx.db.get(existingMemberId);
+      if (!member || member.groupId !== group._id || member.userId) {
+        throw new Error("That unclaimed member profile is not available.");
+      }
+      if (
+        groupMembers.some(
+          (groupMember) =>
+            groupMember._id !== member._id &&
+            normalizedMemberName(groupMember.name) ===
+              normalizedMemberName(member.name),
+        )
+      ) {
+        throw new Error("Member names must be unique within a group.");
+      }
+      memberId = member._id;
+      await ctx.db.patch(memberId, { userId: identity.subject });
+    } else {
+      if (
+        groupMembers.some(
+          (groupMember) =>
+            normalizedMemberName(groupMember.name) ===
+            normalizedMemberName(cleanMemberName),
+        )
+      ) {
+        throw new Error("Member names must be unique within a group.");
+      }
+      memberId = await ctx.db.insert("members", {
+        groupId: group._id,
+        userId: identity.subject,
+        name: cleanMemberName,
+        daysOff: [],
+        daysOffRemaining: 0,
+      });
+    }
+    await ctx.db.insert("groupMemberships", {
+      groupId: group._id,
+      userId: identity.subject,
+      memberId,
+      role: "member",
+      joinedAt: Date.now(),
+    });
+  },
+});
+
+export const rotateGroupInviteCode = mutation({
+  args: { inviteCode: v.string() },
+  handler: async (ctx, { inviteCode }) => {
+    const { group } = await requireManager(ctx);
+    if (inviteCode.length < 32 || inviteCode.length > 80) {
+      throw new Error("Generate a valid group invite code.");
+    }
+    const existingCode = await ctx.db
+      .query("groups")
+      .withIndex("by_invite_code", (q) => q.eq("inviteCode", inviteCode))
+      .unique();
+    if (existingCode && existingCode._id !== group._id) {
+      throw new Error("Invite code collision. Please try again.");
+    }
+    await ctx.db.patch(group._id, { inviteCode });
+  },
+});
+
+export const getGroupMembers = query({
+  args: {},
+  handler: async (ctx) => {
+    const { group } = await requireGroup(ctx);
+    const [members, memberships] = await Promise.all([
+      ctx.db
+        .query("members")
+        .withIndex("by_group", (q) => q.eq("groupId", group._id))
+        .collect(),
+      ctx.db
+        .query("groupMemberships")
+        .withIndex("by_group", (q) => q.eq("groupId", group._id))
+        .collect(),
+    ]);
+    const membershipByMember = new Map(
+      memberships.map((membership) => [membership.memberId, membership]),
+    );
+    const identity = await ctx.auth.getUserIdentity();
+    return members.map((member) => ({
+      id: member._id,
+      name: member.name,
+      role: membershipByMember.get(member._id)?.role ?? "unclaimed",
+      isSelf: membershipByMember.get(member._id)?.userId === identity?.subject,
+    }));
+  },
+});
+
 export const getSnapshot = query({
   args: {},
   handler: async (ctx) => {
-    const [
-      members,
-      choreTypes,
-      dutyTypes,
-      chores,
-      duties,
-      memberConstraints,
-      settings,
-    ] = await Promise.all([
-      ctx.db.query("members").collect(),
-      ctx.db.query("choreTypes").collect(),
-      ctx.db.query("dutyTypes").collect(),
-      ctx.db.query("chores").collect(),
-      ctx.db.query("duties").collect(),
-      ctx.db.query("memberConstraints").collect(),
-      ctx.db.query("schedulerSettings").first(),
-    ]);
+    const { group } = await requireGroup(ctx);
+    const [members, choreTypes, dutyTypes, chores, duties, memberConstraints, settings] =
+      await Promise.all([
+        ctx.db.query("members").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("choreTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("dutyTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("chores").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("duties").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("memberConstraints").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("schedulerSettings").withIndex("by_group", (q) => q.eq("groupId", group._id)).first(),
+      ]);
     chores.sort((left, right) => left._creationTime - right._creationTime);
 
     const memberNames = new Map(
@@ -138,6 +469,7 @@ export const getSnapshot = query({
 
     return {
       people: members.map((member) => member.name),
+      memberIds: members.map((member) => member._id),
       tasks: tasksByDay,
       chores: choresByDay,
       assignments: assignmentsByDay,
@@ -162,6 +494,7 @@ export const getSnapshot = query({
         );
         return {
           member: member.name,
+          memberId: member._id,
           blockedDuties: constraint?.blockedDuties ?? [],
           blockedChores: constraint?.blockedChores ?? [],
           daysOff: member.daysOff ?? [],
@@ -179,9 +512,248 @@ export const getSnapshot = query({
   },
 });
 
+export const getMemberProfile = query({
+  args: { memberId: v.id("members") },
+  handler: async (ctx, { memberId }) => {
+    const { group, membership } = await requireGroup(ctx);
+    const member = await ctx.db.get(memberId);
+    if (!member || member.groupId !== group._id) {
+      return null;
+    }
+    if (membership.role !== "manager" && membership.memberId !== memberId) {
+      return null;
+    }
+
+    const [chores, choreTypes, duties, dutyTypes, constraints, absences] =
+      await Promise.all([
+        ctx.db.query("chores").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("choreTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("duties").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db.query("dutyTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+        ctx.db
+          .query("memberConstraints")
+          .withIndex("by_member", (q) => q.eq("memberId", memberId))
+          .first(),
+        ctx.db
+          .query("memberAbsences")
+          .withIndex("by_member_date", (q) => q.eq("memberId", memberId))
+          .collect(),
+      ]);
+    const choreNames = new Map(choreTypes.map((chore) => [chore._id, chore.name]));
+    const dutyNames = new Map(dutyTypes.map((duty) => [duty._id, duty.name]));
+
+    return {
+      id: member._id,
+      name: member.name,
+      role: membership.role,
+      daysOff: member.daysOff ?? [],
+      daysOffRemaining: member.daysOffRemaining ?? 0,
+      blockedDuties: constraints?.blockedDuties ?? [],
+      blockedChores: constraints?.blockedChores ?? [],
+      activities: {
+        chores: chores.flatMap((chore) =>
+          chore.assignedMemberId === memberId
+            ? [{ day: chore.day, name: choreNames.get(chore.choreTypeId) ?? "" }]
+            : [],
+        ),
+        duties: duties.flatMap((duty) =>
+          duty.memberId === memberId
+            ? [{ day: duty.day, name: dutyNames.get(duty.dutyTypeId) ?? "" }]
+            : [],
+        ),
+      },
+      absences: absences.map(({ _id, date, kind, status }) => ({
+        id: _id,
+        date,
+        kind,
+        status,
+      })),
+    };
+  },
+});
+
+export const setMemberDaysOffRemaining = mutation({
+  args: {
+    memberId: v.id("members"),
+    daysOffRemaining: v.number(),
+  },
+  handler: async (ctx, { memberId, daysOffRemaining }) => {
+    const { group } = await requireManager(ctx);
+    if (!Number.isSafeInteger(daysOffRemaining) || daysOffRemaining < 0) {
+      throw new Error("Remaining days off must be a non-negative whole number.");
+    }
+    const member = await ctx.db.get(memberId);
+    if (!member || member.groupId !== group._id) {
+      throw new Error("This member no longer exists.");
+    }
+    await ctx.db.patch(memberId, { daysOffRemaining });
+  },
+});
+
+function isValidISODate(date: string): boolean {
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return (
+    !Number.isNaN(parsed.getTime()) &&
+    parsed.toISOString().slice(0, 10) === date
+  );
+}
+
+function nextWeekStartISO(now: Date): string {
+  const nextWeek = new Date(
+    Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate() - now.getUTCDay() + 7,
+    ),
+  );
+  return nextWeek.toISOString().slice(0, 10);
+}
+
+function isNextWeekDate(date: string, now: Date): boolean {
+  if (!isValidISODate(date)) {
+    return false;
+  }
+  const start = new Date(`${nextWeekStartISO(now)}T00:00:00.000Z`).getTime();
+  const value = new Date(`${date}T00:00:00.000Z`).getTime();
+  return value >= start && value < start + 7 * 24 * 60 * 60 * 1000;
+}
+
+export const requestMemberDayOff = mutation({
+  args: { memberId: v.id("members"), date: v.string() },
+  handler: async (ctx, { memberId, date }) => {
+    const { group, membership } = await requireGroup(ctx);
+    if (membership.memberId !== memberId) {
+      throw new Error("You can only request time off for your own member profile.");
+    }
+    if (!isNextWeekDate(date, new Date())) {
+      throw new Error("Day-off requests can only be made for next week.");
+    }
+    const member = await ctx.db.get(memberId);
+    if (!member || member.groupId !== group._id) {
+      throw new Error("This member no longer exists.");
+    }
+    const existing = await ctx.db
+      .query("memberAbsences")
+      .withIndex("by_member_date", (q) =>
+        q.eq("memberId", memberId).eq("date", date),
+      )
+      .collect();
+    if (existing.some((absence) => absence.status !== "declined")) {
+      throw new Error("An absence is already recorded for that date.");
+    }
+    const remaining = member.daysOffRemaining ?? 0;
+    const pendingCount = (
+      await ctx.db
+        .query("memberAbsences")
+        .withIndex("by_member_date", (q) => q.eq("memberId", memberId))
+        .collect()
+    ).filter(
+      (absence) =>
+        absence.kind === "day-off" && absence.status === "pending",
+    ).length;
+    if (remaining - pendingCount < 1) {
+      throw new Error("No unreserved days off remain to request.");
+    }
+    await ctx.db.insert("memberAbsences", {
+      groupId: group._id,
+      memberId,
+      date,
+      kind: "day-off",
+      status: "pending",
+    });
+  },
+});
+
+export const reportMemberSickDay = mutation({
+  args: { memberId: v.id("members"), date: v.string() },
+  handler: async (ctx, { memberId, date }) => {
+    const { group, membership } = await requireGroup(ctx);
+    if (membership.memberId !== memberId) {
+      throw new Error("You can only report sick days for your own member profile.");
+    }
+    if (!isValidISODate(date)) {
+      throw new Error("Choose a valid date for the sick-day report.");
+    }
+    if (date > new Date().toISOString().slice(0, 10)) {
+      throw new Error("Sick days can only be reported for today or an earlier date.");
+    }
+    const member = await ctx.db.get(memberId);
+    if (!member || member.groupId !== group._id) {
+      throw new Error("This member no longer exists.");
+    }
+    const existing = await ctx.db
+      .query("memberAbsences")
+      .withIndex("by_member_date", (q) =>
+        q.eq("memberId", memberId).eq("date", date),
+      )
+      .collect();
+    if (existing.some((absence) => absence.status !== "declined")) {
+      throw new Error("An absence is already recorded for that date.");
+    }
+    await ctx.db.insert("memberAbsences", {
+      groupId: group._id,
+      memberId,
+      date,
+      kind: "sick",
+      status: "approved",
+    });
+  },
+});
+
+export const reviewMemberDayOffRequest = mutation({
+  args: {
+    absenceId: v.id("memberAbsences"),
+    approve: v.boolean(),
+  },
+  handler: async (ctx, { absenceId, approve }) => {
+    const { group } = await requireManager(ctx);
+    const absence = await ctx.db.get(absenceId);
+    if (
+      !absence ||
+      absence.groupId !== group._id ||
+      absence.kind !== "day-off" ||
+      absence.status !== "pending"
+    ) {
+      throw new Error("This day-off request is no longer pending.");
+    }
+    if (!approve) {
+      await ctx.db.patch(absenceId, { status: "declined" });
+      return;
+    }
+    if (absence.date < new Date().toISOString().slice(0, 10)) {
+      throw new Error("Past day-off requests cannot be approved.");
+    }
+    const member = await ctx.db.get(absence.memberId);
+    if (!member || member.groupId !== group._id) {
+      throw new Error("This member no longer exists.");
+    }
+    const remaining = member.daysOffRemaining ?? 0;
+    if (remaining < 1) {
+      throw new Error("This member has no remaining days off.");
+    }
+    await ctx.db.patch(member._id, { daysOffRemaining: remaining - 1 });
+    await ctx.db.patch(absenceId, { status: "approved" });
+  },
+});
+
 export const saveSnapshot = mutation({
   args: snapshotValidator,
   handler: async (ctx, snapshot) => {
+    const { group } = await requireManager(ctx);
+    if (snapshot.memberIds.length !== snapshot.members.length) {
+      throw new Error("Member identities do not match the member list.");
+    }
+    const uniqueNames = new Set<string>();
+    for (const name of snapshot.members) {
+      const normalizedName = normalizedMemberName(name);
+      if (!normalizedName) {
+        continue;
+      }
+      if (uniqueNames.has(normalizedName)) {
+        throw new Error("Member names must be unique within a group.");
+      }
+      uniqueNames.add(normalizedName);
+    }
     if (
       !Number.isFinite(snapshot.defaultChoreWeight) ||
       snapshot.defaultChoreWeight < 0 ||
@@ -211,41 +783,225 @@ export const saveSnapshot = mutation({
         );
       }
     }
+    const assignmentsByDay = new Map<Weekday, typeof snapshot.assignments>();
+    for (const day of weekDays) {
+      const choresForDay = snapshot.chores.filter((chore) => chore.day === day);
+      const assignmentsForDay = snapshot.assignments.filter(
+        (assignment) => assignment.day === day,
+      );
+      if (
+        choresForDay.length !== assignmentsForDay.length ||
+        choresForDay.some(
+          (chore, index) => chore.chore !== assignmentsForDay[index]?.chore,
+        )
+      ) {
+        throw new Error("Chore assignments do not match the current schedule.");
+      }
+      assignmentsByDay.set(day, assignmentsForDay);
 
-    const members = await ctx.db.query("members").collect();
-    const membersByName = new Map(members.map((member) => [member.name, member]));
+      const choresByMember = new Map<string, typeof assignmentsForDay>();
+      for (const assignment of assignmentsForDay) {
+        if (!assignment.member) continue;
+        const member = snapshot.members.find(
+          (name) => name.trim() === assignment.member,
+        );
+        if (!member) {
+          throw new Error(`"${assignment.member}" is not a saved member.`);
+        }
+        const constraint = snapshot.memberConstraints.find(
+          (entry) => entry.member.trim() === member,
+        );
+        if (constraint?.daysOff.includes(day)) {
+          throw new Error(`${member} is unavailable on ${day}.`);
+        }
+        const assigned = choresByMember.get(member) ?? [];
+        assigned.push(assignment);
+        choresByMember.set(member, assigned);
+
+        const memberDuties = snapshot.duties.filter(
+          (duty) => duty.member.trim() === member,
+        );
+        const dutiesToday = memberDuties
+          .filter((duty) => duty.day === day)
+          .map((duty) =>
+            snapshot.dutyTypes.find(
+              (dutyType) => dutyType.name === duty.duty.trim(),
+            ),
+          )
+          .filter((dutyType) => dutyType !== undefined);
+        const nextDay = weekDays[weekDays.indexOf(day) + 1];
+        const blockedByDuty =
+          dutiesToday.some(
+            (duty) =>
+              duty.restriction === "unavailable-today" ||
+              duty.restriction === "unavailable-today-and-previous-day" ||
+              (duty.restriction === "only-selected-chores" &&
+                !duty.allowedChores.includes(assignment.chore)),
+          ) ||
+          (nextDay !== undefined &&
+            memberDuties.some(
+              (duty) =>
+                duty.day === nextDay &&
+                snapshot.dutyTypes.find(
+                  (dutyType) => dutyType.name === duty.duty.trim(),
+                )?.restriction === "unavailable-today-and-previous-day",
+            ));
+        if (
+          blockedByDuty ||
+          constraint?.blockedChores.includes(assignment.chore) ||
+          dutiesToday.some((duty) =>
+            constraint?.blockedDuties.includes(duty.name),
+          )
+        ) {
+          throw new Error(`${member} is not eligible for "${assignment.chore}" on ${day}.`);
+        }
+      }
+
+      for (const [member, assigned] of choresByMember) {
+        if (
+          assigned.length > 1 &&
+          assigned.some((assignment) =>
+            snapshot.choreTypes.find(
+              (choreType) => choreType.name === assignment.chore,
+            )?.onePerMemberPerDay,
+          )
+        ) {
+          throw new Error(
+            `${member} cannot have multiple chores on ${day} because of a one-per-day restriction.`,
+          );
+        }
+      }
+    }
+
+    const previousChores = (await ctx.db
+      .query("chores")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect()).sort(
+      (left, right) => left._creationTime - right._creationTime,
+    );
+    const previousMembers = await ctx.db
+      .query("members")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
+    const previousMemberNames = new Map(
+      previousMembers.map((member) => [member._id, member.name]),
+    );
+    const previousChoreTypes = await ctx.db
+      .query("choreTypes")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
+    const previousChoreNames = new Map(
+      previousChoreTypes.map((choreType) => [choreType._id, choreType.name]),
+    );
+    const previousAssignments = previousChores.map((chore) => ({
+      day: chore.day,
+      chore: previousChoreNames.get(chore.choreTypeId) ?? "",
+      member: chore.assignedMemberId
+        ? previousMemberNames.get(chore.assignedMemberId) ?? null
+        : null,
+    }));
+    const currentAssignments = snapshot.assignments;
+    const assignmentKey = (
+      entries: typeof snapshot.assignments,
+    ) =>
+      JSON.stringify(
+        [...entries]
+          .map(({ day, chore, member }) => ({ day, chore, member }))
+          .sort(
+            (left, right) =>
+              weekDays.indexOf(left.day) - weekDays.indexOf(right.day) ||
+              left.chore.localeCompare(right.chore) ||
+              (left.member ?? "").localeCompare(right.member ?? ""),
+          ),
+      );
+    const scheduleChanged =
+      previousAssignments.length > 0 &&
+      assignmentKey(previousAssignments) !== assignmentKey(currentAssignments);
+
+    const members = previousMembers;
     const memberIds = new Map<string, Id<"members">>();
-    for (const name of snapshot.members) {
+    const retainedMemberIds = new Set<Id<"members">>();
+    for (const [index, name] of snapshot.members.entries()) {
       const cleanName = name.trim();
-      if (!cleanName || memberIds.has(cleanName)) {
+      if (!cleanName) {
+        if (snapshot.memberIds[index]) {
+          throw new Error("Member names cannot be empty.");
+        }
         continue;
       }
-      const existing = membersByName.get(cleanName);
-      const attendance = snapshot.memberConstraints.find(
-        (constraint) => constraint.member.trim() === cleanName,
-      );
+      const requestedId = snapshot.memberIds[index];
+      const requestedMember = requestedId
+        ? await ctx.db.get(requestedId)
+        : null;
+      if (requestedMember && requestedMember.groupId !== group._id) {
+        throw new Error("A member belongs to a different group.");
+      }
+      const existing =
+        requestedMember ??
+        members.find(
+          (member) =>
+            member.name === cleanName && !retainedMemberIds.has(member._id),
+        );
+      const attendance =
+        (requestedId
+          ? snapshot.memberConstraints.find(
+              (constraint) => constraint.memberId === requestedId,
+            )
+          : undefined) ??
+        snapshot.memberConstraints.find(
+          (constraint) => constraint.member.trim() === cleanName,
+        );
       const memberId =
         existing?._id ??
         (await ctx.db.insert("members", {
+          groupId: group._id,
           name: cleanName,
           daysOff: attendance?.daysOff,
         }));
-      memberIds.set(cleanName, memberId);
+      if (!memberIds.has(cleanName)) {
+        memberIds.set(cleanName, memberId);
+      }
+      retainedMemberIds.add(memberId);
       if (
         existing &&
-        JSON.stringify(existing.daysOff ?? []) !==
-          JSON.stringify(attendance?.daysOff ?? [])
+        (existing.name !== cleanName ||
+          JSON.stringify(existing.daysOff ?? []) !==
+            JSON.stringify(attendance?.daysOff ?? []))
       ) {
-        await ctx.db.patch(existing._id, { daysOff: attendance?.daysOff });
+        await ctx.db.patch(existing._id, {
+          groupId: group._id,
+          name: cleanName,
+          daysOff: attendance?.daysOff,
+        });
       }
     }
     for (const member of members) {
-      if (!memberIds.has(member.name)) {
+      if (!retainedMemberIds.has(member._id)) {
+        const memberships = await ctx.db
+          .query("groupMemberships")
+          .withIndex("by_member", (q) => q.eq("memberId", member._id))
+          .collect();
+        if (memberships.some((membership) => membership.role === "manager")) {
+          throw new Error("The group manager profile cannot be removed.");
+        }
+        const absences = await ctx.db
+          .query("memberAbsences")
+          .withIndex("by_member_date", (q) => q.eq("memberId", member._id))
+          .collect();
+        for (const absence of absences) {
+          await ctx.db.delete(absence._id);
+        }
+        for (const membership of memberships) {
+          await ctx.db.delete(membership._id);
+        }
         await ctx.db.delete(member._id);
       }
     }
 
-    const choreTypeDocuments = await ctx.db.query("choreTypes").collect();
+    const choreTypeDocuments = await ctx.db
+      .query("choreTypes")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
     const choreTypesByName = new Map(
       choreTypeDocuments.map((chore) => [chore.name, chore]),
     );
@@ -257,6 +1013,7 @@ export const saveSnapshot = mutation({
       }
       const existing = choreTypesByName.get(name);
       const id = existing?._id ?? (await ctx.db.insert("choreTypes", {
+        groupId: group._id,
         name,
         weight: chore.weight,
         onePerMemberPerDay: chore.onePerMemberPerDay,
@@ -279,7 +1036,10 @@ export const saveSnapshot = mutation({
       }
     }
 
-    const dutyTypeDocuments = await ctx.db.query("dutyTypes").collect();
+    const dutyTypeDocuments = await ctx.db
+      .query("dutyTypes")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
     const dutyTypesByName = new Map(
       dutyTypeDocuments.map((duty) => [duty.name, duty]),
     );
@@ -296,6 +1056,7 @@ export const saveSnapshot = mutation({
       const id =
         existing?._id ??
         (await ctx.db.insert("dutyTypes", {
+          groupId: group._id,
           name,
           weight: duty.weight,
           restriction: duty.restriction,
@@ -321,13 +1082,27 @@ export const saveSnapshot = mutation({
       }
     }
 
-    const chores = await ctx.db.query("chores").collect();
+    const chores = await ctx.db
+      .query("chores")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
+    chores.sort((left, right) => left._creationTime - right._creationTime);
     const retainedChoreIds = new Set<Id<"chores">>();
+    const choreOccurrences = new Map<string, number>();
     for (const chore of snapshot.chores) {
+      const occurrenceKey = `${chore.day}\u0000${chore.chore.trim()}`;
+      const occurrence = choreOccurrences.get(occurrenceKey) ?? 0;
+      choreOccurrences.set(occurrenceKey, occurrence + 1);
       const choreTypeId = choreTypeIds.get(chore.chore.trim());
       if (!choreTypeId) {
         continue;
       }
+      const assignment = assignmentsByDay
+        .get(chore.day)
+        ?.filter((entry) => entry.chore === chore.chore.trim())[occurrence];
+      const assignedMemberId = assignment?.member
+        ? memberIds.get(assignment.member)
+        : undefined;
       const existing = chores.find(
         (entry) =>
           !retainedChoreIds.has(entry._id) &&
@@ -336,10 +1111,15 @@ export const saveSnapshot = mutation({
       );
       if (existing) {
         retainedChoreIds.add(existing._id);
+        if (existing.assignedMemberId !== assignedMemberId) {
+          await ctx.db.patch(existing._id, { assignedMemberId });
+        }
       } else {
         const id = await ctx.db.insert("chores", {
+          groupId: group._id,
           day: chore.day,
           choreTypeId,
+          ...(assignedMemberId ? { assignedMemberId } : {}),
         });
         retainedChoreIds.add(id);
       }
@@ -350,7 +1130,10 @@ export const saveSnapshot = mutation({
       }
     }
 
-    const duties = await ctx.db.query("duties").collect();
+    const duties = await ctx.db
+      .query("duties")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
     const retainedDutyIds = new Set<Id<"duties">>();
     for (const duty of snapshot.duties) {
       const memberId = memberIds.get(duty.member.trim());
@@ -375,6 +1158,7 @@ export const saveSnapshot = mutation({
           retainedDutyIds.add(existing._id);
         } else {
           const id = await ctx.db.insert("duties", {
+            groupId: group._id,
             day: duty.day,
             memberId,
             dutyTypeId,
@@ -391,6 +1175,7 @@ export const saveSnapshot = mutation({
 
     const constraintDocuments = await ctx.db
       .query("memberConstraints")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
       .collect();
     const constraintsByMember = new Map(
       constraintDocuments.map((constraint) => [
@@ -400,7 +1185,8 @@ export const saveSnapshot = mutation({
     );
     const retainedConstraintIds = new Set<Id<"memberConstraints">>();
     for (const constraint of snapshot.memberConstraints) {
-      const memberId = memberIds.get(constraint.member.trim());
+      const memberId =
+        constraint.memberId ?? memberIds.get(constraint.member.trim());
       if (!memberId) {
         continue;
       }
@@ -416,6 +1202,7 @@ export const saveSnapshot = mutation({
         retainedConstraintIds.add(existing._id);
       } else {
         const id = await ctx.db.insert("memberConstraints", {
+          groupId: group._id,
           memberId,
           blockedDuties,
           blockedChores,
@@ -429,13 +1216,14 @@ export const saveSnapshot = mutation({
       }
     }
 
-    const currentDuties = await ctx.db.query("duties").collect();
-    const currentDutyTypes = await ctx.db.query("dutyTypes").collect();
+    const currentDuties = duties;
+    const currentDutyTypes = dutyTypeDocuments;
     const currentDutyTypesById = new Map(
       currentDutyTypes.map((dutyType) => [dutyType._id, dutyType]),
     );
     const currentMemberConstraints = await ctx.db
       .query("memberConstraints")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
       .collect();
     const currentConstraintsByMember = new Map(
       currentMemberConstraints.map((constraint) => [
@@ -443,17 +1231,17 @@ export const saveSnapshot = mutation({
         constraint,
       ]),
     );
-    const memberIdsInDatabase = new Set(memberIds.values());
+    const memberIdsInDatabase = retainedMemberIds;
     const currentMembersById = new Map(
       members.map((member) => [member._id, member]),
     );
     const choreTypesById = new Map(
-      (await ctx.db.query("choreTypes").collect()).map((choreType) => [
+      choreTypeDocuments.map((choreType) => [
         choreType._id,
         choreType,
       ]),
     );
-    const choresWithAssignments = await ctx.db.query("chores").collect();
+    const choresWithAssignments = chores;
     for (const chore of choresWithAssignments) {
       const memberId = chore.assignedMemberId;
       if (!memberId) {
@@ -513,7 +1301,10 @@ export const saveSnapshot = mutation({
       }
     }
 
-    const settings = await ctx.db.query("schedulerSettings").collect();
+    const settings = await ctx.db
+      .query("schedulerSettings")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
     const settingsDocument = settings[0];
     const settingValues = {
       defaultChoreWeight: snapshot.defaultChoreWeight,
@@ -525,7 +1316,17 @@ export const saveSnapshot = mutation({
         await ctx.db.delete(duplicate._id);
       }
     } else {
-      await ctx.db.insert("schedulerSettings", settingValues);
+      await ctx.db.insert("schedulerSettings", {
+        ...settingValues,
+        groupId: group._id,
+      });
+    }
+    if (scheduleChanged) {
+      await ctx.db.insert("savedSchedules", {
+        groupId: group._id,
+        savedAt: Date.now(),
+        assignments: currentAssignments,
+      });
     }
   },
 });
@@ -541,6 +1342,7 @@ export const saveAssignments = mutation({
     ),
   },
   handler: async (ctx, { assignments }) => {
+    const { group } = await requireManager(ctx);
     const [
       members,
       choreTypes,
@@ -549,12 +1351,12 @@ export const saveAssignments = mutation({
       duties,
       memberConstraints,
     ] = await Promise.all([
-      ctx.db.query("members").collect(),
-      ctx.db.query("choreTypes").collect(),
-      ctx.db.query("dutyTypes").collect(),
-      ctx.db.query("chores").collect(),
-      ctx.db.query("duties").collect(),
-      ctx.db.query("memberConstraints").collect(),
+      ctx.db.query("members").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("choreTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("dutyTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("chores").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("duties").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("memberConstraints").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
     ]);
     const membersByName = new Map(members.map((member) => [member.name, member]));
     const choreTypesById = new Map(
@@ -692,10 +1494,12 @@ export const setAssignment = mutation({
     member: v.union(v.string(), v.null()),
   },
   handler: async (ctx, { day, index, chore, member }) => {
-    const dayChores = (await ctx.db
+    const { group } = await requireManager(ctx);
+    const groupChores = await ctx.db
       .query("chores")
-      .withIndex("by_day", (query) => query.eq("day", day))
-      .collect()).sort(
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
+      .collect();
+    const dayChores = groupChores.filter((entry) => entry.day === day).sort(
       (left, right) => left._creationTime - right._creationTime,
     );
     const target = dayChores[index];
@@ -713,10 +1517,13 @@ export const setAssignment = mutation({
       return;
     }
 
-    const memberDocument = await ctx.db
-      .query("members")
-      .withIndex("by_name", (query) => query.eq("name", member))
-      .first();
+    const memberDocument = groupChores.length
+      ? await ctx.db
+          .query("members")
+          .withIndex("by_group", (q) => q.eq("groupId", group._id))
+          .filter((q) => q.eq(q.field("name"), member))
+          .first()
+      : null;
     if (!memberDocument) {
       throw new Error(`"${member}" is not a saved member.`);
     }
@@ -724,8 +1531,8 @@ export const setAssignment = mutation({
       throw new Error(`${member} is marked unavailable on ${day}.`);
     }
     const [dutyTypes, duties] = await Promise.all([
-      ctx.db.query("dutyTypes").collect(),
-      ctx.db.query("duties").collect(),
+      ctx.db.query("dutyTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("duties").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
     ]);
     const assignedOnDay = dayChores.filter(
       (entry, choreIndex) =>
@@ -798,16 +1605,30 @@ export const setAssignment = mutation({
 export const getSavedSchedules = query({
   args: {},
   handler: async (ctx) => {
+    const { group } = await requireGroup(ctx);
     const schedules = await ctx.db
       .query("savedSchedules")
-      .withIndex("by_saved_at")
-      .order("desc")
+      .withIndex("by_group", (q) => q.eq("groupId", group._id))
       .collect();
-    return schedules.map(({ _id, savedAt, assignments }) => ({
+    return schedules
+      .sort((left, right) => right.savedAt - left.savedAt)
+      .map(({ _id, savedAt, assignments }) => ({
       id: _id,
       savedAt,
       assignments,
-    }));
+      }));
+  },
+});
+
+export const deleteSavedSchedule = mutation({
+  args: { scheduleId: v.id("savedSchedules") },
+  handler: async (ctx, { scheduleId }) => {
+    const { group } = await requireManager(ctx);
+    const schedule = await ctx.db.get(scheduleId);
+    if (!schedule || schedule.groupId !== group._id) {
+      throw new Error("This saved week no longer exists.");
+    }
+    await ctx.db.delete(scheduleId);
   },
 });
 
@@ -822,14 +1643,15 @@ export const saveScheduleHistory = mutation({
     ),
   },
   handler: async (ctx, { assignments }) => {
+    const { group } = await requireManager(ctx);
     const [members, choreTypes, chores, dutyTypes, duties, memberConstraints] =
       await Promise.all([
-      ctx.db.query("members").collect(),
-      ctx.db.query("choreTypes").collect(),
-      ctx.db.query("chores").collect(),
-      ctx.db.query("dutyTypes").collect(),
-      ctx.db.query("duties").collect(),
-      ctx.db.query("memberConstraints").collect(),
+      ctx.db.query("members").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("choreTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("chores").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("dutyTypes").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("duties").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
+      ctx.db.query("memberConstraints").withIndex("by_group", (q) => q.eq("groupId", group._id)).collect(),
     ]);
     const membersByName = new Map(members.map((member) => [member.name, member]));
     const dutyTypesById = new Map(
@@ -959,6 +1781,7 @@ export const saveScheduleHistory = mutation({
     }
 
     await ctx.db.insert("savedSchedules", {
+      groupId: group._id,
       savedAt: Date.now(),
       assignments,
     });

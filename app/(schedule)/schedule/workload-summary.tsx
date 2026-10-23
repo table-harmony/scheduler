@@ -33,7 +33,7 @@ export function WorkloadSummary({
         <SectionCard className="py-4">
           <p className="text-sm text-muted-foreground">
             {generated
-              ? "Add members to see their workload after generating the schedule."
+              ? "Invite group members to see their workload after generating the schedule."
               : "Generate the schedule to compare members’ weighted workload."}
           </p>
         </SectionCard>

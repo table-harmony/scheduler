@@ -4,6 +4,7 @@ import {
   type WeeklyChoreAssignments,
   type WeeklyChores,
   type WeeklyTasks,
+  type Weekday,
   type WorkloadWeights,
   defaultWorkloadWeights,
   weekDays,

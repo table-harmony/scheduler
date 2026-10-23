@@ -12,6 +12,10 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useScheduler } from "@/app/scheduler-context";
 import { usePathname } from "next/navigation";
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "@/convex/_generated/api";
+import { AuthenticatedWorkspace } from "@/components/authenticated-workspace";
 
 const links = [
   { href: "/schedule", label: "Schedule", icon: CalendarDays },
@@ -25,13 +29,26 @@ export default function SchedulerLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const { loaded, saving, error, reset } = useScheduler();
-  const currentPage = usePathname().split("/").pop();
+  return (
+    <AuthenticatedWorkspace>
+      <SchedulerLayoutContent>{children}</SchedulerLayoutContent>
+    </AuthenticatedWorkspace>
+  );
+}
+
+function SchedulerLayoutContent({ children }: { children: React.ReactNode }) {
+  const { loaded, saving, error, reset, role } = useScheduler();
+  const pathname = usePathname();
+  const group = useQuery(api.scheduler.getMyGroup, {});
+  const rotateInviteCode = useMutation(api.scheduler.rotateGroupInviteCode);
+  const [groupError, setGroupError] = useState<string | null>(null);
+  const [inviteCopied, setInviteCopied] = useState(false);
+  const isManager = role === "manager";
+  const managerOnlyPage =
+    !isManager && (pathname === "/duties" || pathname === "/rules");
   const isActiveLink = (href: string): boolean =>
-    (currentPage === "schedule" && href === "/schedule") ||
-    (currentPage === "members" && href === "/members") ||
-    (currentPage === "duties" && href === "/duties") ||
-    (currentPage === "rules" && href === "/rules");
+    pathname === href ||
+    (href === "/members" && pathname.startsWith("/members/"));
 
   return (
     <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6 lg:px-8">
@@ -56,12 +73,86 @@ export default function SchedulerLayout({
                 ? "Saving to Convex…"
                 : "Saved to Convex"}
           </span>
-          <Button variant="outline" onClick={reset}>
-            <RotateCcw data-icon="inline-start" />
-            Reset
-          </Button>
+          {isManager && (
+            <Button variant="outline" onClick={reset}>
+              <RotateCcw data-icon="inline-start" />
+              Reset
+            </Button>
+          )}
         </div>
       </header>
+
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-lg border px-4 py-3">
+        <div>
+          <p className="font-medium">{group?.name ?? "Your group"}</p>
+          <p className="text-sm text-muted-foreground">
+            Signed in as {group?.memberName ?? "member"} · {role}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {isManager && group && (
+            <>
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  setGroupError(null);
+                  try {
+                    await navigator.clipboard.writeText(group.inviteCode);
+                    setInviteCopied(true);
+                  } catch (caught) {
+                    setGroupError(
+                      caught instanceof Error
+                        ? caught.message
+                        : "Could not copy the invite code.",
+                    );
+                  }
+                }}
+              >
+                {inviteCopied ? "Invite code copied" : "Copy invite code"}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  if (
+                    !window.confirm(
+                      "Rotate the invite code? Existing codes will stop working.",
+                    )
+                  ) {
+                    return;
+                  }
+                  setGroupError(null);
+                  try {
+                    await rotateInviteCode({
+                      inviteCode: crypto.randomUUID(),
+                    });
+                    setInviteCopied(false);
+                  } catch (caught) {
+                    setGroupError(
+                      caught instanceof Error
+                        ? caught.message
+                        : "Could not rotate the invite code.",
+                    );
+                  }
+                }}
+              >
+                Rotate invite
+              </Button>
+            </>
+          )}
+          <Link
+            className={cn(buttonVariants({ variant: "ghost" }))}
+            href="/logout"
+          >
+            Log out
+          </Link>
+        </div>
+      </div>
+
+      {groupError && (
+        <p className="mb-4 text-sm text-destructive" role="alert">
+          {groupError}
+        </p>
+      )}
 
       {error && (
         <div
@@ -76,7 +167,9 @@ export default function SchedulerLayout({
         aria-label="Scheduler pages"
         className="mb-6 flex flex-wrap gap-2 border-b pb-4"
       >
-        {links.map(({ href, label, icon: Icon }) => (
+        {links
+          .filter(({ href }) => isManager || (href !== "/duties" && href !== "/rules"))
+          .map(({ href, label, icon: Icon }) => (
           <Link
             key={href}
             href={href}
@@ -90,10 +183,16 @@ export default function SchedulerLayout({
             <Icon data-icon="inline-start" />
             {label}
           </Link>
-        ))}
+          ))}
       </nav>
 
-      {children}
+      {managerOnlyPage ? (
+        <p className="text-sm text-muted-foreground">
+          Only the group manager can edit duties and scheduling rules.
+        </p>
+      ) : (
+        children
+      )}
     </main>
   );
 }

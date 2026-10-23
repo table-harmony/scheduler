@@ -1,6 +1,7 @@
 "use client";
 
 import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
 import { useMutation, useQuery } from "convex/react";
 import {
   createContext,
@@ -33,15 +34,17 @@ export type TaskEntry = {
 
 export type SchedulerData = {
   people: string[];
+  memberIds: (Id<"members"> | null)[];
   tasks: Record<Weekday, TaskEntry[]>;
   chores: Record<Weekday, string[]>;
   weights: WorkloadWeights;
   rules: SchedulingRules;
   memberConstraints: MemberConstraints;
+  memberConstraintsById: MemberConstraints;
 };
 
 export type SavedSchedule = {
-  id: string;
+  id: Id<"savedSchedules">;
   savedAt: number;
   assignments: { day: Weekday; chore: string; member: string | null }[];
 };
@@ -54,8 +57,11 @@ export type GeneratedSchedule = {
 };
 
 export type PageKind = "schedule" | "members" | "duties" | "rules";
+export type GroupRole = "manager" | "member";
 
 export type SchedulerContextValue = {
+  role: GroupRole;
+  currentMemberId: Id<"members">;
   data: SchedulerData;
   savedAssignments: Record<Weekday, (string | null)[]>;
   persistedAssignments: Record<Weekday, (string | null)[]>;
@@ -65,6 +71,7 @@ export type SchedulerContextValue = {
   saveScheduleHistory: (
     assignments: WeeklyChoreAssignments,
   ) => Promise<boolean>;
+  deleteSavedSchedule: (scheduleId: Id<"savedSchedules">) => Promise<boolean>;
   setChoreAssignment: (
     day: Weekday,
     index: number,
@@ -83,6 +90,19 @@ export type SchedulerContextValue = {
     blocked: boolean,
   ) => void;
   setMemberDayOff: (member: string, day: Weekday, isOff: boolean) => void;
+  setMemberConstraintById: (
+    memberId: Id<"members">,
+    member: string,
+    category: "blockedDuties" | "blockedChores",
+    name: string,
+    blocked: boolean,
+  ) => void;
+  setMemberDayOffById: (
+    memberId: Id<"members">,
+    member: string,
+    day: Weekday,
+    isOff: boolean,
+  ) => void;
   setChoreRestriction: (name: string, onePerMemberPerDay: boolean) => void;
   addChore: (day: Weekday) => void;
   setChore: (day: Weekday, index: number, name: string) => void;
@@ -133,11 +153,13 @@ function mapWeek<T>(mapper: (day: Weekday) => T): Record<Weekday, T> {
 function createEmptySchedule(): SchedulerData {
   return {
     people: [],
+    memberIds: [],
     tasks: mapWeek(() => []),
     chores: mapWeek(() => []),
     weights: defaultWorkloadWeights,
     rules: { tasks: {}, chores: {} },
     memberConstraints: {},
+    memberConstraintsById: {},
   };
 }
 
@@ -195,7 +217,15 @@ function hasAssignmentConflict(
   );
 }
 
-export function SchedulerProvider({ children }: { children: React.ReactNode }) {
+export function SchedulerProvider({
+  children,
+  role,
+  currentMemberId,
+}: {
+  children: React.ReactNode;
+  role: GroupRole;
+  currentMemberId: Id<"members">;
+}) {
   const [data, setData] = useState(createEmptySchedule);
   const [savedAssignments, setSavedAssignments] = useState<
     Record<Weekday, (string | null)[]>
@@ -213,6 +243,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   const savedSchedules = useQuery(api.scheduler.getSavedSchedules, {});
   const saveSnapshot = useMutation(api.scheduler.saveSnapshot);
   const archiveSchedule = useMutation(api.scheduler.saveScheduleHistory);
+  const removeSavedSchedule = useMutation(api.scheduler.deleteSavedSchedule);
 
   useEffect(() => {
     if (snapshot === undefined || hasHydrated.current) {
@@ -223,6 +254,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
       skipNextSave.current = true;
       setData({
         people: snapshot.people,
+        memberIds: snapshot.memberIds,
         tasks: snapshot.tasks,
         chores: snapshot.chores,
         weights: {
@@ -258,6 +290,14 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
             ],
           ),
         ),
+        memberConstraintsById: Object.fromEntries(
+          snapshot.memberConstraints.map(
+            ({ memberId, blockedDuties, blockedChores, daysOff }) => [
+              memberId,
+              { blockedDuties, blockedChores, daysOff },
+            ],
+          ),
+        ),
       });
       setSavedAssignments(
         mapWeek((day) => snapshot.assignments[day].map(({ member }) => member)),
@@ -274,6 +314,31 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     if (!hasHydrated.current || snapshot === undefined) {
       return;
     }
+    setData((current) => {
+      const memberIds = [...current.memberIds];
+      let changed = false;
+      const assigned = new Set(
+        memberIds.filter((memberId): memberId is Id<"members"> =>
+          Boolean(memberId),
+        ),
+      );
+      for (const [index, name] of current.people.entries()) {
+        if (memberIds[index] || !name.trim()) {
+          continue;
+        }
+        const snapshotIndex = snapshot.people.findIndex(
+          (savedName, savedIndex) =>
+            savedName === name.trim() &&
+            !assigned.has(snapshot.memberIds[savedIndex]),
+        );
+        if (snapshotIndex >= 0) {
+          memberIds[index] = snapshot.memberIds[snapshotIndex];
+          assigned.add(snapshot.memberIds[snapshotIndex]);
+          changed = true;
+        }
+      }
+      return changed ? { ...current, memberIds } : current;
+    });
     const next = mapWeek((day) =>
       snapshot.assignments[day].map(({ member }) => member),
     );
@@ -284,7 +349,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   }, [snapshot]);
 
   useEffect(() => {
-    if (!loaded || skipNextSave.current) {
+    if (role !== "manager" || !loaded || skipNextSave.current) {
       skipNextSave.current = false;
       return;
     }
@@ -293,6 +358,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
       try {
         await saveSnapshot({
           members: data.people,
+          memberIds: data.memberIds,
           choreTypes: Object.entries(data.weights.chores).map(
             ([name, weight]) => ({
               name,
@@ -320,6 +386,20 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
               .filter((chore) => chore.trim())
               .map((chore) => ({ day, chore })),
           ),
+          assignments: weekDays.flatMap((day) =>
+            data.chores[day].flatMap((chore, index) =>
+              chore.trim()
+                ? [
+                    {
+                      day,
+                      chore,
+                      member:
+                        savedAssignments[day][index]?.trim() || null,
+                    },
+                  ]
+                : [],
+            ),
+          ),
           duties: weekDays.flatMap((day) =>
             data.tasks[day]
               .filter((entry) => entry.member.trim() && entry.task.trim())
@@ -329,14 +409,23 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
                 duty: entry.task.trim(),
               })),
           ),
-          memberConstraints: Object.entries(data.memberConstraints).map(
-            ([member, constraint]) => ({
+          memberConstraints: data.people.map((member, index) => {
+            const memberId = data.memberIds[index] ?? null;
+            const constraint =
+              (memberId && data.memberConstraintsById[memberId]) ||
+              data.memberConstraints[member] || {
+                blockedDuties: [],
+                blockedChores: [],
+                daysOff: [],
+              };
+            return {
               member,
+              memberId,
               blockedDuties: [...constraint.blockedDuties],
               blockedChores: [...constraint.blockedChores],
               daysOff: [...(constraint.daysOff ?? [])],
-            }),
-          ),
+            };
+          }),
           defaultChoreWeight: data.weights.defaultChoreWeight,
           defaultDutyWeight: data.weights.defaultTaskWeight,
         });
@@ -353,7 +442,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     }, 300);
     setSaving(true);
     return () => window.clearTimeout(timeout);
-  }, [data, loaded, saveSnapshot]);
+  }, [data, loaded, role, saveSnapshot, savedAssignments]);
 
   function generateSchedule(): GeneratedSchedule {
     const tasks = toWeeklyTasks(data.tasks);
@@ -421,6 +510,23 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
         saveError instanceof Error
           ? `Could not save this week: ${saveError.message}`
           : "Could not save this week.",
+      );
+      return false;
+    }
+  }
+
+  async function deleteScheduleHistory(
+    scheduleId: Id<"savedSchedules">,
+  ): Promise<boolean> {
+    try {
+      await removeSavedSchedule({ scheduleId });
+      setError(null);
+      return true;
+    } catch (deleteError) {
+      setError(
+        deleteError instanceof Error
+          ? `Could not delete this saved week: ${deleteError.message}`
+          : "Could not delete this saved week.",
       );
       return false;
     }
@@ -505,11 +611,16 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   }
 
   function addMember() {
-    setData((current) => ({ ...current, people: [...current.people, ""] }));
+    setData((current) => ({
+      ...current,
+      people: [...current.people, ""],
+      memberIds: [...current.memberIds, null],
+    }));
   }
 
   function removeMember(index: number) {
     const removed = data.people[index];
+    const removedId = data.memberIds[index];
     setSavedAssignments((assignments) =>
       mapWeek((day) =>
         assignments[day].map((member) => (member === removed ? null : member)),
@@ -522,9 +633,17 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
         people: current.people.filter(
           (_, memberIndex) => memberIndex !== index,
         ),
+        memberIds: current.memberIds.filter(
+          (_, memberIndex) => memberIndex !== index,
+        ),
         memberConstraints: Object.fromEntries(
           Object.entries(current.memberConstraints).filter(
             ([name]) => name !== removed,
+          ),
+        ),
+        memberConstraintsById: Object.fromEntries(
+          Object.entries(current.memberConstraintsById).filter(
+            ([memberId]) => memberId !== removedId,
           ),
         ),
         tasks: mapWeek((day) =>
@@ -621,6 +740,110 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
         },
       };
     });
+  }
+
+  function setMemberConstraintById(
+    memberId: Id<"members">,
+    member: string,
+    category: "blockedDuties" | "blockedChores",
+    name: string,
+    blocked: boolean,
+  ) {
+    if (blocked) {
+      const conflicts =
+        category === "blockedDuties"
+          ? weekDays.some((day) =>
+              data.tasks[day].some(
+                (entry) => entry.member === member && entry.task === name,
+              ),
+            )
+          : weekDays.some((day) =>
+              data.chores[day].some(
+                (chore, index) =>
+                  chore === name && savedAssignments[day][index] === member,
+              ),
+            );
+      if (conflicts) {
+        setError(
+          `Remove ${member} from "${name}" in the current schedule before blocking it.`,
+        );
+        return;
+      }
+    }
+    const constraint = data.memberConstraintsById[memberId] ??
+      data.memberConstraints[member] ?? {
+        blockedDuties: [],
+        blockedChores: [],
+        daysOff: [],
+      };
+    const names = new Set(constraint[category]);
+    if (blocked) {
+      names.add(name);
+    } else {
+      names.delete(name);
+    }
+    const updated = { ...constraint, [category]: [...names] };
+    setError(null);
+    setData((current) => ({
+      ...current,
+      memberConstraints: {
+        ...current.memberConstraints,
+        [member]: updated,
+      },
+      memberConstraintsById: {
+        ...current.memberConstraintsById,
+        [memberId]: updated,
+      },
+    }));
+  }
+
+  function setMemberDayOffById(
+    memberId: Id<"members">,
+    member: string,
+    day: Weekday,
+    isOff: boolean,
+  ) {
+    if (
+      isOff &&
+      data.tasks[day].some((entry) => entry.member === member)
+    ) {
+      setError(
+        `Remove ${member}'s duty on ${day} before marking them unavailable.`,
+      );
+      return;
+    }
+    if (
+      isOff &&
+      data.chores[day].some((_, index) => savedAssignments[day][index] === member)
+    ) {
+      setError(`Unassign ${member}'s chores on ${day} before marking them off.`);
+      return;
+    }
+    const constraint = data.memberConstraintsById[memberId] ??
+      data.memberConstraints[member] ?? {
+        blockedDuties: [],
+        blockedChores: [],
+        daysOff: [],
+      };
+    const daysOff = new Set(constraint.daysOff ?? []);
+    if (isOff) {
+      daysOff.add(day);
+    } else {
+      daysOff.delete(day);
+    }
+    const updated = { ...constraint, daysOff: [...daysOff] };
+    setError(null);
+    setData((current) => ({
+      ...current,
+      memberConstraints: {
+        ...current.memberConstraints,
+        [member]: updated,
+      },
+      memberConstraintsById: {
+        ...current.memberConstraintsById,
+        [memberId]: updated,
+      },
+    }));
   }
 
   function setChoreRestriction(name: string, onePerMemberPerDay: boolean) {
@@ -1114,6 +1337,8 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
   }
 
   const value: SchedulerContextValue = {
+    role,
+    currentMemberId,
     data,
     savedAssignments,
     persistedAssignments,
@@ -1121,6 +1346,7 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     generateSchedule,
     createManualSchedule,
     saveScheduleHistory,
+    deleteSavedSchedule: deleteScheduleHistory,
     setChoreAssignment,
     loaded,
     saving,
@@ -1130,6 +1356,8 @@ export function SchedulerProvider({ children }: { children: React.ReactNode }) {
     removeMember,
     setMemberConstraint,
     setMemberDayOff,
+    setMemberConstraintById,
+    setMemberDayOffById,
     setChoreRestriction,
     addChore,
     setChore,

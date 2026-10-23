@@ -1,6 +1,6 @@
 "use client";
 
-import { CalendarDays, History, Sparkles } from "lucide-react";
+import { CalendarDays, History, Sparkles, Trash2 } from "lucide-react";
 import { useState } from "react";
 import {
   useScheduler,
@@ -41,12 +41,17 @@ export function ScheduleDashboard() {
     generateSchedule,
     createManualSchedule,
     saveScheduleHistory,
+    deleteSavedSchedule,
     setChoreAssignment,
     loaded,
     saving,
+    role,
   } = useScheduler();
   const [generated, setGenerated] = useState<GeneratedSchedule | null>(null);
   const [viewingHistory, setViewingHistory] = useState<string | null>(null);
+  const isManager = role === "manager";
+  const activeGenerated =
+    generated ?? (loaded ? createManualSchedule() : null);
 
   function generateSchedulePreview() {
     setGenerated(generateSchedule());
@@ -82,7 +87,10 @@ export function ScheduleDashboard() {
   }
 
   async function archiveCurrentSchedule() {
-    if (generated && (await saveScheduleHistory(generated.assignments))) {
+    if (
+      activeGenerated &&
+      (await saveScheduleHistory(activeGenerated.assignments))
+    ) {
       setViewingHistory(null);
     }
   }
@@ -139,41 +147,44 @@ export function ScheduleDashboard() {
               Chore assignments
             </h2>
             <p className="mt-2 text-sm text-muted-foreground">
-              Generate balanced assignments or build the schedule yourself.
-              Changes stay as a draft until you confirm and save them.
+              {isManager
+                ? "Generate balanced assignments or build the schedule yourself. Changes stay as a draft until you confirm and save them."
+                : "View this week's chore assignments and previous schedules."}
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="lg"
-              disabled={!loaded}
-              onClick={() => {
-                setGenerated(createManualSchedule());
-                setViewingHistory(null);
-              }}
-            >
-              Create/edit manually
-            </Button>
-            <Form
-              className="shrink-0"
-              onFormSubmit={generateSchedulePreview}
-            >
-              <Button type="submit" size="lg" disabled={!loaded}>
-                <Sparkles data-icon="inline-start" />
-                {generated ? "Regenerate schedule" : "Generate schedule"}
+          {isManager && (
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                disabled={!loaded}
+                onClick={() => {
+                  setGenerated(createManualSchedule());
+                  setViewingHistory(null);
+                }}
+              >
+                Create/edit manually
               </Button>
-            </Form>
-          </div>
+              <Form
+                className="shrink-0"
+                onFormSubmit={generateSchedulePreview}
+              >
+                <Button type="submit" size="lg" disabled={!loaded}>
+                  <Sparkles data-icon="inline-start" />
+                  {activeGenerated ? "Regenerate schedule" : "Generate schedule"}
+                </Button>
+              </Form>
+            </div>
+          )}
         </div>
       </SectionCard>
 
-      <WorkloadSummary generated={generated} />
+      <WorkloadSummary generated={activeGenerated} />
 
-      {(generated || savedSchedules.length > 0) && (
+      {(activeGenerated || savedSchedules.length > 0) && (
         <div className="flex flex-wrap items-center gap-3">
-          {generated && viewingHistory === null && (
+          {isManager && activeGenerated && viewingHistory === null && (
             <Button
               type="button"
               variant="outline"
@@ -190,17 +201,43 @@ export function ScheduleDashboard() {
                 Previous weeks:
               </span>
               {savedSchedules.map((saved) => (
-                <Button
-                  key={saved.id}
-                  type="button"
-                  size="sm"
-                  variant={viewingHistory === saved.id ? "secondary" : "ghost"}
-                  onClick={() => viewSavedSchedule(saved.id)}
-                >
-                  {new Date(saved.savedAt).toLocaleDateString()}
-                </Button>
+                <div className="flex items-center" key={saved.id}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={viewingHistory === saved.id ? "secondary" : "ghost"}
+                    onClick={() => viewSavedSchedule(saved.id)}
+                  >
+                    {new Date(saved.savedAt).toLocaleDateString()}
+                  </Button>
+                  {isManager && (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      aria-label={`Delete saved week from ${new Date(saved.savedAt).toLocaleDateString()}`}
+                      onClick={async () => {
+                        const date = new Date(saved.savedAt).toLocaleDateString();
+                        if (
+                          window.confirm(
+                            `Delete the saved schedule from ${date}? This cannot be undone.`,
+                          )
+                        ) {
+                          if (await deleteSavedSchedule(saved.id)) {
+                            if (viewingHistory === saved.id) {
+                              setGenerated(createManualSchedule());
+                              setViewingHistory(null);
+                            }
+                          }
+                        }
+                      }}
+                    >
+                      <Trash2 />
+                    </Button>
+                  )}
+                </div>
               ))}
-              {viewingHistory !== null && (
+              {isManager && viewingHistory !== null && (
                 <Button
                   type="button"
                   size="sm"
@@ -218,14 +255,14 @@ export function ScheduleDashboard() {
         </div>
       )}
 
-      {generated ? (
+      {activeGenerated ? (
         <AssignmentTable
-          generated={generated}
+          generated={activeGenerated}
           members={data.people}
           tasks={toWeeklyTasks(data.tasks)}
           rules={data.rules}
           memberConstraints={data.memberConstraints}
-          readOnly={viewingHistory !== null}
+          readOnly={!isManager || viewingHistory !== null}
           onAssignmentChange={updateAssignment}
         />
       ) : (

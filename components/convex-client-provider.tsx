@@ -1,8 +1,8 @@
 "use client";
 
-import { ConvexProvider, ConvexReactClient } from "convex/react";
+import { ConvexReactClient } from "convex/react";
+import { ConvexAuthProvider } from "@convex-dev/auth/react";
 import { useEffect, useState } from "react";
-import { SchedulerProvider } from "@/app/scheduler-context";
 
 export function ConvexClientProvider({
   children,
@@ -55,8 +55,8 @@ function ConfiguredConvexProvider({
   }
 
   return (
-    <ConvexProvider client={client}>
-      <SchedulerProvider>{children}</SchedulerProvider>
-    </ConvexProvider>
+    <ConvexAuthProvider client={client}>
+      {children}
+    </ConvexAuthProvider>
   );
 }

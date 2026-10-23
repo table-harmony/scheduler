@@ -1,5 +1,4 @@
-import { DutyDayEditor } from "@/app/(schedule)/duties/editor";
-import { weekDays } from "@/lib/types";
+import { DutyWeekEditor } from "@/app/(schedule)/duties/editor";
 
 export const instant = false;
 
@@ -13,9 +12,7 @@ export default function DutiesPage() {
           & rules.
         </p>
       </header>
-      {weekDays.map((day) => (
-        <DutyDayEditor day={day} key={day} />
-      ))}
+      <DutyWeekEditor />
     </div>
   );
 }
